@@ -1,0 +1,3180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Exhibition Hall Booth Selector v2</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+  html, body, #root { height: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #f3f4f6; color: #111827; }
+  .booth-rect { cursor: pointer; transition: stroke-width 120ms; }
+  .booth-rect:hover { stroke-width: 3; }
+  .booth-label { font-size: 11px; font-weight: 600; pointer-events: none; user-select: none; }
+  .resize-handle { fill: white; stroke: #2563eb; stroke-width: 1.5; cursor: nwse-resize; }
+  .scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scroll-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+  .region-overlay { fill: rgba(37, 99, 235, 0.18); stroke: #2563eb; stroke-width: 2; stroke-dasharray: 6,3; }
+  /* Pending-selection booth highlight (pulsing bright outline) */
+  @keyframes boothPulse {
+    0%   { stroke-opacity: 1;   stroke-width: 4; }
+    50%  { stroke-opacity: 0.4; stroke-width: 6; }
+    100% { stroke-opacity: 1;   stroke-width: 4; }
+  }
+  .booth-pending-primary { stroke: #ec4899; animation: boothPulse 1.1s ease-in-out infinite; }
+  .booth-pending-partner { stroke: #f472b6; animation: boothPulse 1.1s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!--
+  Recent versions of @babel/standalone default to the *automatic* JSX
+  runtime, which emits `require("react/jsx-runtime")` — invalid in a
+  plain browser and produces a blank page. So we skip the automatic
+  <script type="text/babel"> processor, embed the source with a neutral
+  MIME type, and transform it explicitly with runtime: 'classic' so the
+  output uses React.createElement (which our global React provides).
+-->
+<script type="text/babel-src" id="app-source">
+const { useState, useEffect, useRef, useMemo, useCallback, createContext, useContext } = React;
+
+// =====================================================================
+// SECTION 1: Utilities
+// =====================================================================
+const uid = () => Math.random().toString(36).slice(2, 11);
+
+function readableTextColor(hex) {
+  const h = (hex || '#000000').replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return luma > 160 ? '#111827' : '#FFFFFF';
+}
+
+// -------- PDF page 1 -> PNG blob --------
+async function pdfFirstPageToBlob(file, scale = 2) {
+  const arrayBuffer = await file.arrayBuffer();
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const page = await pdf.getPage(1);
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width; canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#FFFFFF'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return new Promise((res) => canvas.toBlob(res, 'image/png', 0.95));
+}
+
+// -------- Detection: Otsu threshold + connected components --------
+function detectBoothRects(image, region = null) {
+  const fullW = image.naturalWidth, fullH = image.naturalHeight;
+  const r = region || { x: 0, y: 0, width: fullW, height: fullH };
+  const MAX_SIDE = 1400;
+  const scale = Math.min(1, MAX_SIDE / Math.max(r.width, r.height));
+  const cw = Math.round(r.width * scale), ch = Math.round(r.height * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = cw; canvas.height = ch;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(image, r.x, r.y, r.width, r.height, 0, 0, cw, ch);
+  const { data } = ctx.getImageData(0, 0, cw, ch);
+
+  const gray = new Uint8Array(cw * ch);
+  for (let i = 0; i < cw * ch; i++)
+    gray[i] = (data[i*4] + data[i*4+1] + data[i*4+2]) / 3;
+
+  // Otsu
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < cw*ch; i++) hist[gray[i]]++;
+  const total = cw*ch;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, varMax = 0, threshold = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (wB === 0) continue;
+    const wF = total - wB; if (wF === 0) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > varMax) { varMax = v; threshold = i; }
+  }
+
+  const binary = new Uint8Array(cw*ch);
+  for (let i = 0; i < cw*ch; i++) binary[i] = gray[i] > threshold ? 1 : 0;
+
+  const labels = new Int32Array(cw*ch);
+  const queue = new Int32Array(cw*ch);
+  const comps = [];
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const idx = y*cw + x;
+    if (binary[idx] === 0 || labels[idx] !== 0) continue;
+    let head = 0, tail = 0;
+    queue[tail++] = idx;
+    labels[idx] = comps.length + 1;
+    let minX = x, minY = y, maxX = x, maxY = y, area = 0;
+    while (head < tail) {
+      const ci = queue[head++];
+      const cx = ci % cw, cy = (ci - cx) / cw;
+      area++;
+      if (cx < minX) minX = cx; if (cy < minY) minY = cy;
+      if (cx > maxX) maxX = cx; if (cy > maxY) maxY = cy;
+      if (cx > 0)      { const ni = ci - 1;  if (binary[ni] && !labels[ni]) { labels[ni] = labels[idx]; queue[tail++] = ni; } }
+      if (cx < cw - 1) { const ni = ci + 1;  if (binary[ni] && !labels[ni]) { labels[ni] = labels[idx]; queue[tail++] = ni; } }
+      if (cy > 0)      { const ni = ci - cw; if (binary[ni] && !labels[ni]) { labels[ni] = labels[idx]; queue[tail++] = ni; } }
+      if (cy < ch - 1) { const ni = ci + cw; if (binary[ni] && !labels[ni]) { labels[ni] = labels[idx]; queue[tail++] = ni; } }
+    }
+    comps.push({ minX, minY, maxX, maxY, area });
+  }
+
+  const minDim = Math.min(cw, ch);
+  const minSide = Math.max(8, minDim * 0.012);
+  const maxSide = minDim * 0.22;
+  const out = [];
+  for (const c of comps) {
+    const bw = c.maxX - c.minX + 1;
+    const bh = c.maxY - c.minY + 1;
+    if (bw < minSide || bh < minSide) continue;
+    if (bw > maxSide || bh > maxSide) continue;
+    if (bw > cw * 0.6 || bh > ch * 0.6) continue;
+    const aspect = bw / bh;
+    if (aspect < 0.5 || aspect > 2) continue;
+    if (c.area / (bw * bh) < 0.55) continue;
+    out.push({
+      x: r.x + c.minX / scale, y: r.y + c.minY / scale,
+      width: bw / scale, height: bh / scale,
+    });
+  }
+  return out;
+}
+
+function groupRows(rects) {
+  if (!rects.length) return [];
+  const sorted = [...rects].sort((a, b) => a.y - b.y);
+  const avgH = sorted.reduce((s, r) => s + r.height, 0) / sorted.length;
+  const gap = avgH * 0.6;
+  const rows = [[sorted[0]]];
+  for (let i = 1; i < sorted.length; i++) {
+    const last = rows[rows.length - 1][rows[rows.length - 1].length - 1];
+    if (Math.abs(sorted[i].y - last.y) <= gap) rows[rows.length - 1].push(sorted[i]);
+    else rows.push([sorted[i]]);
+  }
+  rows.forEach(row => row.sort((a, b) => a.x - b.x));
+  return rows;
+}
+function fallbackLabel(rowIdx, colIdx) {
+  const letter = rowIdx < 26
+    ? String.fromCharCode(65 + rowIdx)
+    : String.fromCharCode(64 + Math.floor(rowIdx / 26)) + String.fromCharCode(65 + (rowIdx % 26));
+  return `${letter}${colIdx + 1}`;
+}
+
+// -------- OCR (Tesseract.js) --------
+let ocrWorker = null;
+async function getOcrWorker() {
+  if (ocrWorker) return ocrWorker;
+  ocrWorker = await Tesseract.createWorker('eng');
+  await ocrWorker.setParameters({
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
+    tessedit_pageseg_mode: '7',
+  });
+  return ocrWorker;
+}
+function buildOcrCanvas(image, rect) {
+  const inset = Math.max(2, Math.min(rect.width, rect.height) * 0.08);
+  const sw = rect.width - 2*inset, sh = rect.height - 2*inset;
+  if (sw < 6 || sh < 6) return null;
+  const targetShort = 160;
+  const scale = Math.max(1, targetShort / Math.min(sw, sh));
+  const cw = Math.round(sw * scale), ch = Math.round(sh * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = cw; canvas.height = ch;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#FFFFFF'; ctx.fillRect(0, 0, cw, ch);
+  ctx.drawImage(image, rect.x+inset, rect.y+inset, sw, sh, 0, 0, cw, ch);
+  const imgData = ctx.getImageData(0, 0, cw, ch);
+  const data = imgData.data;
+  const hist = new Array(256).fill(0);
+  const grays = new Uint8Array(cw * ch);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const g = (data[i] + data[i+1] + data[i+2]) / 3 | 0;
+    grays[p] = g; hist[g]++;
+  }
+  const total = cw*ch;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, varMax = 0, threshold = 160;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (wB === 0) continue;
+    const wF = total - wB; if (wF === 0) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > varMax) { varMax = v; threshold = i; }
+  }
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const v = grays[p] > threshold ? 255 : 0;
+    data[i] = data[i+1] = data[i+2] = v;
+  }
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+}
+async function readOcrLabel(image, rect) {
+  const canvas = buildOcrCanvas(image, rect);
+  if (!canvas) return '';
+  const w = await getOcrWorker();
+  const clean = (s) => (s || '').replace(/[^A-Za-z0-9-]/g, '').toUpperCase().trim();
+  let txt = clean((await w.recognize(canvas)).data.text);
+  if (!txt) {
+    await w.setParameters({ tessedit_pageseg_mode: '6' });
+    txt = clean((await w.recognize(canvas)).data.text);
+    await w.setParameters({ tessedit_pageseg_mode: '7' });
+  }
+  if (!txt || txt === '-' || txt.length > 12) return '';
+  return txt;
+}
+async function labelRectsWithOcr(image, rects, onProgress) {
+  const rows = groupRows(rects);
+  const results = new Map();
+  const seen = new Set();
+  let done = 0;
+  for (let r = 0; r < rows.length; r++) {
+    for (let c = 0; c < rows[r].length; c++) {
+      const rect = rows[r][c];
+      let label = '';
+      try { label = await readOcrLabel(image, rect); } catch (_) { label = ''; }
+      if (!label || seen.has(label)) {
+        label = fallbackLabel(r, c);
+        let unique = label, n = 1;
+        while (seen.has(unique)) unique = `${label}.${++n}`;
+        label = unique;
+      }
+      seen.add(label);
+      results.set(rect, label);
+      done++;
+      onProgress?.({ done, total: rects.length, label });
+    }
+  }
+  return rects.map(x => ({ ...x, label: results.get(x) || 'X' }));
+}
+
+// -------- Sample data --------
+const DEFAULT_LEVELS = [
+  { id: 'general', name: 'General', color: '#3B82F6' },
+];
+// All demo sponsors default to the General category. Admin can add more
+// categories from the sidebar; sponsors' categories are editable from tinker
+// or a future admin UI. Booleans below flag the double-booth sponsors.
+const SAMPLE_COMPANIES = [
+  ['Acme Industries',    'general', true ],
+  ['Bridgepoint Labs',   'general', false],
+  ['Cascade Logistics',  'general', false],
+  ['Delta Bioworks',     'general', true ],
+  ['Evergreen Robotics', 'general', false],
+  ['Fortis Materials',   'general', false],
+  ['Globex Pharma',      'general', false],
+  ['Helios Energy',      'general', false],
+  ['Initech Software',   'general', false],
+  ['Jovian Aerospace',   'general', false],
+  ['Kestrel Networks',   'general', false],
+  ['Lumen Optics',       'general', false],
+  ['Meridian Health',    'general', true ],
+  ['Nimbus Cloud',       'general', false],
+  ['Orion Diagnostics',  'general', false],
+  ['Pinnacle Foods',     'general', false],
+  ['Quanta Sensors',     'general', false],
+  ['Rivendell Wines',    'general', false],
+  ['Stratos Medical',    'general', false],
+  ['Trident Capital',    'general', false],
+  ['Umbra Security',     'general', false],
+  ['Vector Mobility',    'general', false],
+];
+function generateSampleSponsors(levels) {
+  const byName = Object.fromEntries(levels.map(l => [l.name.toLowerCase(), l]));
+  const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return SAMPLE_COMPANIES.map(([name, lvlKey, isDouble], i) => {
+    const level = byName[lvlKey] || levels[levels.length - 1];
+    return {
+      id: uid(),
+      name,
+      levelId: level.id,
+      isDoubleBooth: isDouble,
+      position: i,
+      logoUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=${level.color.slice(1)}&color=fff&size=128&font-size=0.4&bold=true&rounded=true`,
+      // Placeholder company URL. In production these come from your CMS/API.
+      website: `https://www.${slug(name)}.example`,
+    };
+  });
+}
+
+// -------- Adjacency helpers (for double-booth partner search) --------
+// Returns { vertical, horizontal } — each is the nearest empty adjacent
+// booth in that orientation (or null if none). "Vertical" means one is
+// stacked above/below the other with overlapping X. "Horizontal" means
+// side-by-side with overlapping Y.
+function findAdjacentPartners(booth, allBooths) {
+  const tol = Math.max(booth.width, booth.height) * 0.25;
+  const candidates = allBooths.filter(b =>
+    b.levelId === booth.levelId && b.id !== booth.id && !b.sponsorId);
+  const isVert = (a, b) => {
+    const aL = a.x, aR = a.x + a.width, aT = a.y, aB = a.y + a.height;
+    const bL = b.x, bR = b.x + b.width, bT = b.y, bB = b.y + b.height;
+    const vGap = Math.min(Math.abs(aB - bT), Math.abs(bB - aT));
+    const hOverlap = Math.min(aR, bR) - Math.max(aL, bL);
+    return vGap <= tol && hOverlap > 0;
+  };
+  const isHoriz = (a, b) => {
+    const aL = a.x, aR = a.x + a.width, aT = a.y, aB = a.y + a.height;
+    const bL = b.x, bR = b.x + b.width, bT = b.y, bB = b.y + b.height;
+    const hGap = Math.min(Math.abs(aR - bL), Math.abs(bR - aL));
+    const vOverlap = Math.min(aB, bB) - Math.max(aT, bT);
+    return hGap <= tol && vOverlap > 0;
+  };
+  const nearestOf = (list) => {
+    if (!list.length) return null;
+    list.sort((p, q) => {
+      const dp = Math.hypot((booth.x+booth.width/2) - (p.x+p.width/2), (booth.y+booth.height/2) - (p.y+p.height/2));
+      const dq = Math.hypot((booth.x+booth.width/2) - (q.x+q.width/2), (booth.y+booth.height/2) - (q.y+q.height/2));
+      return dp - dq;
+    });
+    return list[0];
+  };
+  return {
+    vertical:   nearestOf(candidates.filter(c => isVert(booth, c))),
+    horizontal: nearestOf(candidates.filter(c => isHoriz(booth, c))),
+  };
+}
+
+// Pick the appropriate partner given the current orientation setting.
+// - 'vertical' / 'horizontal' → strict; returns null if that orientation has no partner
+// - 'user-toggle' → prefers `preferred`, falls back to whichever is available
+function pickPartnerBySetting(booth, allBooths, orientation, preferred) {
+  const parts = findAdjacentPartners(booth, allBooths);
+  if (orientation === 'vertical')   return parts.vertical;
+  if (orientation === 'horizontal') return parts.horizontal;
+  if (preferred === 'vertical'   && parts.vertical)   return parts.vertical;
+  if (preferred === 'horizontal' && parts.horizontal) return parts.horizontal;
+  return parts.vertical || parts.horizontal;
+}
+
+// Backwards-compat alias used in a few spots — always returns something
+// that fits the current orientation setting (falls back to any adjacent).
+function findAdjacentEmpty(booth, allBooths, orientation = 'user-toggle') {
+  return pickPartnerBySetting(booth, allBooths, orientation);
+}
+
+// =====================================================================
+// SECTION 2: Store (Context + custom hook)
+// =====================================================================
+const StoreContext = createContext(null);
+const useStore = () => useContext(StoreContext);
+
+// -------- Local project persistence (localStorage) --------
+const PROJECTS_KEY = 'booth-selector-v2-projects';
+function loadProjectsIndex() {
+  try {
+    const raw = localStorage.getItem(PROJECTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+function writeProjectsIndex(projects) {
+  try { localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects)); return true; }
+  catch (e) {
+    alert('Could not save — most likely browser storage is full. Delete an old project and try again. (' + (e.message || e) + ')');
+    return false;
+  }
+}
+
+function useStoreProvider() {
+  const [role, setRole] = useState('admin');
+  const [floorPlan, setFloorPlan] = useState(null);
+  const [booths, setBooths] = useState([]);
+  const [levels, setLevels] = useState(DEFAULT_LEVELS);
+  const [sponsors, setSponsors] = useState(() => generateSampleSponsors(DEFAULT_LEVELS));
+  const [settings, setSettings] = useState({
+    showAssignmentsToSponsors: true,
+    showSponsorLogos: true,
+    enforceSelectionOrder: true,
+    doubleBoothOrientation: 'vertical', // 'vertical' | 'horizontal' | 'user-toggle'
+  });
+  const [activeSponsorId, setActiveSponsorId] = useState(null);
+  const [projects, setProjects] = useState(() => loadProjectsIndex());
+  const [currentProjectId, setCurrentProjectId] = useState(null);
+
+  // --- lookup helpers ---
+  const levelById  = useMemo(() => Object.fromEntries(levels.map(l => [l.id, l])), [levels]);
+  const sponsorById = useMemo(() => Object.fromEntries(sponsors.map(s => [s.id, s])), [sponsors]);
+  const boothById  = useMemo(() => Object.fromEntries(booths.map(b => [b.id, b])), [booths]);
+
+  const boothsAtLevel = useCallback((lid) => booths.filter(b => b.levelId === lid), [booths]);
+  const sponsorsAtLevel = useCallback((lid) =>
+    sponsors.filter(s => s.levelId === lid).sort((a, b) => a.position - b.position),
+    [sponsors]);
+  const unassignedSponsorsAtLevel = useCallback((lid) =>
+    sponsorsAtLevel(lid).filter(sp => !booths.some(b => b.sponsorId === sp.id)),
+    [sponsorsAtLevel, booths]);
+
+  const canSponsorPickNow = useCallback((sponsorId) => {
+    if (!settings.enforceSelectionOrder) return true;
+    const sp = sponsorById[sponsorId];
+    if (!sp) return false;
+    if (booths.some(b => b.sponsorId === sp.id && b.locked)) return false;
+    const ordered = sponsorsAtLevel(sp.levelId);
+    for (const ahead of ordered) {
+      if (ahead.id === sp.id) return true;
+      const aheadHas = booths.some(b => b.sponsorId === ahead.id);
+      if (!aheadHas) return false;
+    }
+    return false;
+  }, [settings.enforceSelectionOrder, booths, sponsorById, sponsorsAtLevel]);
+
+  // --- mutators ---
+  const uploadFloorPlan = useCallback((dataUrl, w, h) => {
+    setFloorPlan({ dataUrl, width: w, height: h });
+  }, []);
+  const replaceFloorPlanImage = useCallback((dataUrl, w, h) => {
+    setFloorPlan(fp => fp ? { ...fp, dataUrl, width: w, height: h } : { dataUrl, width: w, height: h });
+  }, []);
+
+  const saveDetectedBooths = useCallback((detected) => {
+    const generalLevel = levels.find(l => l.name.toLowerCase() === 'general') || levels[levels.length - 1];
+    setBooths(detected.map(b => ({
+      id: uid(),
+      label: b.label, x: b.x, y: b.y, width: b.width, height: b.height,
+      levelId: generalLevel.id,
+      sponsorId: null, locked: false, partnerBoothId: null,
+    })));
+  }, [levels]);
+
+  const createBooth = useCallback((rect) => {
+    const generalLevel = levels.find(l => l.name.toLowerCase() === 'general') || levels[0];
+    const newBooth = {
+      id: uid(),
+      label: rect.label || `New ${booths.length + 1}`,
+      x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+      levelId: rect.levelId || generalLevel.id,
+      sponsorId: null, locked: false, partnerBoothId: null,
+    };
+    setBooths(bs => [...bs, newBooth]);
+    return newBooth;
+  }, [levels, booths.length]);
+
+  const updateBooth = useCallback((id, patch) => {
+    setBooths(bs => bs.map(b => b.id === id ? { ...b, ...patch } : b));
+  }, []);
+
+  const deleteBooth = useCallback((id) => {
+    setBooths(bs => {
+      const target = bs.find(b => b.id === id);
+      let next = bs.filter(b => b.id !== id);
+      if (target?.partnerBoothId) {
+        next = next.map(b => b.id === target.partnerBoothId
+          ? { ...b, sponsorId: null, locked: false, partnerBoothId: null } : b);
+      }
+      return next;
+    });
+  }, []);
+
+  const assignSponsor = useCallback((boothId, sponsorId, opts = {}) => {
+    setBooths(bs => {
+      const booth = bs.find(b => b.id === boothId);
+      const sponsor = sponsors.find(s => s.id === sponsorId);
+      if (!booth || !sponsor) return bs;
+      // Free previous booths held by this sponsor
+      let next = bs.map(b => b.sponsorId === sponsorId
+        ? { ...b, sponsorId: null, locked: false, partnerBoothId: null } : b);
+      let partnerId = opts.partnerBoothId ?? null;
+      if (sponsor.isDoubleBooth) {
+        if (!partnerId) {
+          const partner = pickPartnerBySetting(booth, next, settings.doubleBoothOrientation, opts.orientation);
+          partnerId = partner?.id || null;
+        }
+        if (!partnerId) {
+          const label = settings.doubleBoothOrientation === 'vertical'
+            ? 'a vertically adjacent'
+            : settings.doubleBoothOrientation === 'horizontal'
+              ? 'a horizontally adjacent'
+              : 'an adjacent';
+          alert(`${sponsor.name} needs a double booth, but ${label} empty same-category booth was not found.`);
+          return bs;
+        }
+      }
+      next = next.map(b => {
+        if (b.id === boothId) return { ...b, sponsorId, locked: !!opts.lock, partnerBoothId: partnerId };
+        if (b.id === partnerId) return { ...b, sponsorId, locked: !!opts.lock, partnerBoothId: boothId };
+        return b;
+      });
+      return next;
+    });
+  }, [sponsors, settings.doubleBoothOrientation]);
+
+  const lockBoothForSponsor = useCallback((boothId, sponsorId, opts = {}) => {
+    const sponsor = sponsors.find(s => s.id === sponsorId);
+    if (!sponsor) return { ok: false, message: 'Sponsor not found.' };
+    const booth = booths.find(b => b.id === boothId);
+    if (!booth) return { ok: false, message: 'Booth not found.' };
+    if (booth.levelId !== sponsor.levelId) return { ok: false, message: 'Category mismatch.' };
+    if (booths.some(b => b.sponsorId === sponsorId && b.locked))
+      return { ok: false, message: 'Sponsor already has a locked booth. Contact your meeting planner.' };
+    if (settings.enforceSelectionOrder) {
+      const ordered = sponsorsAtLevel(sponsor.levelId);
+      for (const ahead of ordered) {
+        if (ahead.id === sponsor.id) break;
+        const aheadHas = booths.some(b => b.sponsorId === ahead.id);
+        if (!aheadHas) return { ok: false, message: `Selection order is enforced: ${ahead.name} must be assigned a booth first.` };
+      }
+    }
+    let partnerId = opts.partnerBoothId ?? null;
+    if (sponsor.isDoubleBooth) {
+      if (!partnerId) {
+        const partner = pickPartnerBySetting(booth, booths, settings.doubleBoothOrientation, opts.orientation);
+        partnerId = partner?.id || null;
+      }
+      if (!partnerId) {
+        const label = settings.doubleBoothOrientation === 'vertical'
+          ? 'vertically adjacent'
+          : settings.doubleBoothOrientation === 'horizontal'
+            ? 'horizontally adjacent'
+            : 'adjacent';
+        return { ok: false, message: `Double booth requires a ${label} empty same-category booth.` };
+      }
+    }
+    setBooths(bs => bs.map(b => {
+      if (b.id === boothId) return { ...b, sponsorId, locked: true, partnerBoothId: partnerId };
+      if (b.id === partnerId) return { ...b, sponsorId, locked: true, partnerBoothId: boothId };
+      return b;
+    }));
+    return { ok: true };
+  }, [booths, sponsors, settings.enforceSelectionOrder, settings.doubleBoothOrientation, sponsorsAtLevel]);
+
+  const unassignBooth = useCallback((boothId) => {
+    setBooths(bs => {
+      const target = bs.find(b => b.id === boothId);
+      if (!target) return bs;
+      return bs.map(b => {
+        if (b.id === boothId || b.id === target.partnerBoothId)
+          return { ...b, sponsorId: null, locked: false, partnerBoothId: null };
+        return b;
+      });
+    });
+  }, []);
+
+  const createLevel = useCallback(() => {
+    const l = { id: 'lvl-' + uid(), name: 'New Category', color: '#10B981' };
+    setLevels(ls => [...ls, l]);
+  }, []);
+  const updateLevel = useCallback((id, patch) => {
+    setLevels(ls => ls.map(l => l.id === id ? { ...l, ...patch } : l));
+  }, []);
+  const deleteLevel = useCallback((id) => {
+    setLevels(ls => {
+      if (ls.length <= 1) { alert('Cannot delete the last category.'); return ls; }
+      const fallback = ls.find(l => l.id !== id);
+      setBooths(bs => bs.map(b => b.levelId === id ? { ...b, levelId: fallback.id } : b));
+      setSponsors(ss => ss.map(s => s.levelId === id ? { ...s, levelId: fallback.id } : s));
+      return ls.filter(l => l.id !== id);
+    });
+  }, []);
+
+  const updateSponsor = useCallback((id, patch) => {
+    setSponsors(ss => ss.map(s => s.id === id ? { ...s, ...patch } : s));
+  }, []);
+  const reorderSponsors = useCallback((levelId, sponsorIds) => {
+    setSponsors(ss => {
+      const map = new Map(ss.map(s => [s.id, s]));
+      sponsorIds.forEach((id, i) => {
+        const sp = map.get(id);
+        if (sp && sp.levelId === levelId) map.set(id, { ...sp, position: i });
+      });
+      return Array.from(map.values());
+    });
+  }, []);
+
+  const updateSettings = useCallback((patch) => {
+    setSettings(s => ({ ...s, ...patch }));
+  }, []);
+
+  // Replace the sponsor list with an imported set. Callers pass an array of
+  // objects already shaped as our sponsors (built via the mapper below).
+  const replaceSponsors = useCallback((imported) => {
+    setSponsors(imported);
+    // Any assignments to sponsors we just removed are wiped from booths.
+    const keepIds = new Set(imported.map(s => s.id));
+    setBooths(bs => bs.map(b =>
+      b.sponsorId && !keepIds.has(b.sponsorId)
+        ? { ...b, sponsorId: null, locked: false, partnerBoothId: null }
+        : b
+    ));
+  }, []);
+
+  const startOver = useCallback(() => {
+    setFloorPlan(null);
+    setBooths([]);
+    setSponsors(generateSampleSponsors(levels));
+    setActiveSponsorId(null);
+    setCurrentProjectId(null);
+  }, [levels]);
+
+  // -------- Project actions --------
+  const saveCurrentAsProject = useCallback((name, existingId = null) => {
+    if (!floorPlan) { alert('Upload a floor plan first before saving.'); return null; }
+    const id = existingId || 'proj-' + uid();
+    const record = {
+      id, name: name.trim() || 'Untitled project',
+      updatedAt: new Date().toISOString(),
+      data: {
+        floorPlan,
+        booths,
+        levels,
+        sponsors,
+        settings,
+      },
+    };
+    let next;
+    setProjects(prev => {
+      const idx = prev.findIndex(p => p.id === id);
+      next = idx === -1 ? [...prev, record] : prev.map(p => p.id === id ? record : p);
+      return next;
+    });
+    // writeProjectsIndex is called with the "next" value on next microtask
+    // — schedule it here so we persist before the next render.
+    setTimeout(() => writeProjectsIndex(next), 0);
+    setCurrentProjectId(id);
+    return id;
+  }, [floorPlan, booths, levels, sponsors, settings]);
+
+  const loadProject = useCallback((id) => {
+    const p = projects.find(x => x.id === id);
+    if (!p) return;
+    // Deep-clone so subsequent edits don't mutate the stored copy
+    const d = JSON.parse(JSON.stringify(p.data));
+    setFloorPlan(d.floorPlan);
+    setBooths(d.booths || []);
+    setLevels(d.levels && d.levels.length ? d.levels : DEFAULT_LEVELS);
+    setSponsors(d.sponsors || []);
+    setSettings({ ...settings, ...(d.settings || {}) });
+    setActiveSponsorId(null);
+    setCurrentProjectId(id);
+  }, [projects, settings]);
+
+  const deleteProject = useCallback((id) => {
+    setProjects(prev => {
+      const next = prev.filter(p => p.id !== id);
+      setTimeout(() => writeProjectsIndex(next), 0);
+      return next;
+    });
+    if (currentProjectId === id) setCurrentProjectId(null);
+  }, [currentProjectId]);
+
+  const renameProject = useCallback((id, name) => {
+    setProjects(prev => {
+      const next = prev.map(p => p.id === id
+        ? { ...p, name: name.trim() || p.name, updatedAt: new Date().toISOString() }
+        : p);
+      setTimeout(() => writeProjectsIndex(next), 0);
+      return next;
+    });
+  }, []);
+
+  return {
+    role, setRole,
+    floorPlan, booths, levels, sponsors, settings,
+    activeSponsorId, setActiveSponsorId,
+    levelById, sponsorById, boothById,
+    boothsAtLevel, sponsorsAtLevel, unassignedSponsorsAtLevel,
+    canSponsorPickNow,
+    uploadFloorPlan, replaceFloorPlanImage, saveDetectedBooths,
+    createBooth, updateBooth, deleteBooth,
+    assignSponsor, lockBoothForSponsor, unassignBooth,
+    createLevel, updateLevel, deleteLevel,
+    updateSponsor, reorderSponsors, updateSettings, startOver,
+    replaceSponsors,
+    projects, currentProjectId, saveCurrentAsProject, loadProject, deleteProject, renameProject,
+  };
+}
+
+// =====================================================================
+// SECTION 3: Shared UI
+// =====================================================================
+function TopBar() {
+  const store = useStore();
+  const [saveOpen, setSaveOpen] = useState(false);
+  const currentProject = store.currentProjectId
+    ? store.projects.find(p => p.id === store.currentProjectId) : null;
+  return (
+    <div className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between flex-shrink-0">
+      <div className="flex items-center gap-3">
+        <div className="w-8 h-8 rounded bg-blue-600 text-white flex items-center justify-center font-bold">B</div>
+        <div>
+          <div className="font-semibold text-gray-900">
+            Booth Selector v2
+            {currentProject && (
+              <span className="ml-2 text-xs font-normal text-gray-500">
+                · {currentProject.name}
+              </span>
+            )}
+          </div>
+          <div className="text-xs text-gray-500">Exhibition Hall Floor Plan · React</div>
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        {store.floorPlan && store.role === 'admin' && (
+          <button onClick={() => setSaveOpen(true)}
+                  className="text-xs px-2 py-1 border border-gray-300 rounded bg-white hover:bg-gray-50">
+            💾 Save project
+          </button>
+        )}
+        {store.floorPlan && (
+          <button onClick={() => confirm('Start over? This clears the floor plan and all assignments (the saved project, if any, is not deleted).') && store.startOver()}
+                  className="text-xs text-gray-500 hover:text-gray-800 underline">
+            Start over
+          </button>
+        )}
+        {saveOpen && <SaveProjectModal onClose={() => setSaveOpen(false)} />}
+        <div className="bg-gray-100 rounded-lg p-1 flex">
+          <button onClick={() => store.setRole('admin')}
+                  className={`px-3 py-1.5 rounded-md text-sm font-medium ${store.role === 'admin' ? 'bg-white shadow text-gray-900' : 'text-gray-600'}`}>
+            Admin
+          </button>
+          <button onClick={() => store.setRole('user')}
+                  className={`px-3 py-1.5 rounded-md text-sm font-medium ${store.role === 'user' ? 'bg-white shadow text-gray-900' : 'text-gray-600'}`}>
+            Sponsor
+          </button>
+          <button onClick={() => store.setRole('public')}
+                  className={`px-3 py-1.5 rounded-md text-sm font-medium ${store.role === 'public' ? 'bg-white shadow text-gray-900' : 'text-gray-600'}`}>
+            Public
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Modal({ children, onClose, size = 'md', backdropClose = true, dim = 'rgba(0,0,0,0.4)' }) {
+  const widths = { sm: 'max-w-sm', md: 'max-w-md', lg: 'max-w-lg', xl: 'max-w-2xl', full: 'max-w-6xl' };
+  return (
+    <div className="fixed inset-0 flex items-center justify-center z-50 p-4"
+         style={{ background: dim }}
+         onClick={() => backdropClose && onClose?.()}>
+      <div className={`bg-white rounded-xl shadow-xl w-full ${widths[size]}`}
+           onClick={(e) => e.stopPropagation()}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function SaveProjectModal({ onClose }) {
+  const store = useStore();
+  const currentProject = store.currentProjectId
+    ? store.projects.find(p => p.id === store.currentProjectId) : null;
+  const [name, setName] = useState(currentProject?.name || 'Untitled project');
+  const [mode, setMode] = useState(currentProject ? 'overwrite' : 'new'); // 'overwrite' | 'new'
+
+  const handleSave = () => {
+    if (mode === 'overwrite' && currentProject) {
+      store.saveCurrentAsProject(name, currentProject.id);
+    } else {
+      store.saveCurrentAsProject(name);
+    }
+    onClose();
+  };
+
+  return (
+    <Modal onClose={onClose} size="sm">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-center gap-2">
+        <h3 className="text-lg font-semibold text-gray-900">Save project</h3>
+        <button onClick={onClose} className="ml-auto text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+      </div>
+      <div className="px-5 py-4 space-y-3">
+        <div>
+          <label className="text-xs text-gray-600 block">Project name</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} autoFocus
+                 className="w-full text-sm border border-gray-300 rounded px-2 py-1" />
+        </div>
+        {currentProject && (
+          <div className="text-xs">
+            <label className="flex items-center gap-2 cursor-pointer py-0.5">
+              <input type="radio" checked={mode === 'overwrite'} onChange={() => setMode('overwrite')} />
+              Overwrite <strong>{currentProject.name}</strong>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer py-0.5">
+              <input type="radio" checked={mode === 'new'} onChange={() => setMode('new')} />
+              Save as a new project
+            </label>
+          </div>
+        )}
+        <div className="text-xs text-gray-500">
+          Projects are stored in this browser's local storage — they persist across reloads but are visible only on this device.
+        </div>
+      </div>
+      <div className="px-5 py-3 border-t border-gray-200 flex justify-end gap-2">
+        <button onClick={onClose} className="px-3 py-1.5 text-sm text-gray-600 hover:text-gray-900">Cancel</button>
+        <button onClick={handleSave} disabled={!name.trim()}
+                className="px-3 py-1.5 text-sm bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:opacity-40">
+          Save
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// =====================================================================
+// SECTION 4: Upload flow
+// =====================================================================
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = src;
+  });
+}
+
+function ScanRegionSelector({ imageSrc, imageWidth, imageHeight, region, onChangeRegion }) {
+  const containerRef = useRef(null);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+  const [drag, setDrag] = useState(null);
+  const [dragRect, setDragRect] = useState(null);
+
+  useEffect(() => {
+    const fit = () => {
+      if (!containerRef.current) return;
+      const r = containerRef.current.getBoundingClientRect();
+      const s = Math.min(r.width / imageWidth, r.height / imageHeight, 1);
+      setSize({ w: imageWidth * s, h: imageHeight * s, scale: s });
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [imageWidth, imageHeight]);
+
+  const scale = size.scale || 1;
+  const screenToImage = (cx, cy) => {
+    const r = containerRef.current.getBoundingClientRect();
+    return { x: (cx - r.left) / scale, y: (cy - r.top) / scale };
+  };
+
+  const onMouseDown = (e) => {
+    const p = screenToImage(e.clientX, e.clientY);
+    setDrag(p);
+    setDragRect({ x: p.x, y: p.y, width: 0, height: 0 });
+  };
+  useEffect(() => {
+    if (!drag) return;
+    const onMove = (e) => {
+      const p = screenToImage(e.clientX, e.clientY);
+      setDragRect({
+        x: Math.min(drag.x, p.x), y: Math.min(drag.y, p.y),
+        width: Math.abs(p.x - drag.x), height: Math.abs(p.y - drag.y),
+      });
+    };
+    const onUp = () => {
+      if (dragRect && dragRect.width > 10 && dragRect.height > 10) {
+        onChangeRegion(dragRect);
+      }
+      setDrag(null); setDragRect(null);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [drag, dragRect]);
+
+  return (
+    <div ref={containerRef} className="flex-1 bg-gray-100 relative overflow-hidden" onMouseDown={onMouseDown}>
+      <div style={{ position: 'absolute', left: 0, top: 0, width: size.w, height: size.h }}>
+        <img src={imageSrc} alt="floor plan" draggable={false}
+             style={{ width: size.w, height: size.h, display: 'block', userSelect: 'none' }} />
+        <svg width={size.w} height={size.h} viewBox={`0 0 ${imageWidth} ${imageHeight}`}
+             style={{ position: 'absolute', left: 0, top: 0 }}>
+          {region && <rect x={region.x} y={region.y} width={region.width} height={region.height} className="region-overlay" />}
+          {dragRect && <rect x={dragRect.x} y={dragRect.y} width={dragRect.width} height={dragRect.height} className="region-overlay" />}
+        </svg>
+      </div>
+    </div>
+  );
+}
+
+function SavedProjectsList() {
+  const store = useStore();
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameValue, setRenameValue] = useState('');
+  if (!store.projects.length) return null;
+  const sorted = [...store.projects].sort((a, b) =>
+    (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+
+  const fmtDate = (iso) => {
+    if (!iso) return '';
+    try { return new Date(iso).toLocaleString(); } catch { return iso; }
+  };
+
+  return (
+    <div className="max-w-2xl w-full bg-white rounded-2xl border border-gray-200 shadow-sm">
+      <div className="px-5 py-3 border-b border-gray-100 flex items-center gap-2">
+        <h3 className="text-sm font-semibold text-gray-900">Or load a saved project</h3>
+        <span className="text-xs text-gray-500 ml-auto">
+          {store.projects.length} saved in this browser
+        </span>
+      </div>
+      <div className="divide-y divide-gray-100 max-h-80 overflow-auto scroll-thin">
+        {sorted.map(p => (
+          <div key={p.id} className="px-5 py-3 flex items-center gap-3 hover:bg-gray-50">
+            <div className="flex-1 min-w-0">
+              {renamingId === p.id ? (
+                <input
+                  autoFocus value={renameValue}
+                  onChange={(e) => setRenameValue(e.target.value)}
+                  onBlur={() => { store.renameProject(p.id, renameValue); setRenamingId(null); }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') { store.renameProject(p.id, renameValue); setRenamingId(null); }
+                    if (e.key === 'Escape') setRenamingId(null);
+                  }}
+                  className="w-full text-sm border border-gray-300 rounded px-2 py-1" />
+              ) : (
+                <div className="text-sm text-gray-900 truncate">{p.name}</div>
+              )}
+              <div className="text-xs text-gray-500 mt-0.5">
+                {p.data?.booths?.length ?? 0} booths · {p.data?.sponsors?.length ?? 0} sponsors · updated {fmtDate(p.updatedAt)}
+              </div>
+            </div>
+            <button onClick={() => store.loadProject(p.id)}
+                    className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700">
+              Open
+            </button>
+            <button onClick={() => { setRenamingId(p.id); setRenameValue(p.name); }}
+                    className="text-xs px-2 py-1.5 border border-gray-300 rounded bg-white hover:bg-gray-50" title="Rename">
+              ✎
+            </button>
+            <button onClick={() => confirm(`Delete "${p.name}"? This can't be undone.`) && store.deleteProject(p.id)}
+                    className="text-xs px-2 py-1.5 border border-red-200 text-red-600 rounded hover:bg-red-50" title="Delete">
+              🗑
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function UploadStep() {
+  const store = useStore();
+  const inputRef = useRef(null);
+  const [step, setStep] = useState('pick'); // pick | region | ocr
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [imageEl, setImageEl] = useState(null);
+  const [imgDims, setImgDims] = useState({ w: 0, h: 0 });
+  const [region, setRegion] = useState(null);
+  const [ocrProgress, setOcrProgress] = useState({ done: 0, total: 0, label: '' });
+
+  const handleFile = async (file) => {
+    if (!file) return;
+    setError(''); setBusy(true);
+    try {
+      let dataUrl;
+      if (file.type === 'application/pdf') {
+        const blob = await pdfFirstPageToBlob(file);
+        dataUrl = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+      } else if (file.type.startsWith('image/')) {
+        dataUrl = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(file); });
+      } else throw new Error('Please upload a PNG, JPG, or PDF.');
+      const img = await loadImage(dataUrl);
+      setPreviewUrl(dataUrl);
+      setImageEl(img);
+      setImgDims({ w: img.naturalWidth, h: img.naturalHeight });
+      setStep('region');
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runDetection = async (useRegion) => {
+    setBusy(true);
+    try {
+      const rects = detectBoothRects(imageEl, useRegion ? region : null);
+      let labelled = [];
+      if (rects.length) {
+        setStep('ocr');
+        setOcrProgress({ done: 0, total: rects.length, label: '' });
+        labelled = await labelRectsWithOcr(imageEl, rects, (p) => setOcrProgress({ ...p }));
+      }
+      store.uploadFloorPlan(previewUrl, imgDims.w, imgDims.h);
+      store.saveDetectedBooths(labelled);
+      if (!labelled.length) {
+        alert('No booth squares were auto-detected. Switch to "+ Add" in the sidebar to draw them manually, or click "Re-run auto-detect" to try a different scan region.');
+      }
+    } catch (e) {
+      setError(e.message || String(e));
+      setStep('region');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault();
+    if (e.dataTransfer.files?.length) handleFile(e.dataTransfer.files[0]);
+  };
+  const progressPct = ocrProgress.total ? Math.round((ocrProgress.done / ocrProgress.total) * 100) : 0;
+
+  if (step === 'pick') {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center p-8 gap-4 overflow-auto">
+        <div onDragOver={(e) => e.preventDefault()} onDrop={onDrop}
+             className="max-w-2xl w-full bg-white border-2 border-dashed border-gray-300 rounded-2xl p-12 text-center">
+          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-blue-50 flex items-center justify-center">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-blue-600">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
+            </svg>
+          </div>
+          <h2 className="text-xl font-semibold text-gray-900 mb-2">Upload Floor Plan</h2>
+          <p className="text-gray-500 mb-6">PNG, JPG, or PDF — we'll auto-detect booth squares and read their printed labels with OCR.</p>
+          <input ref={inputRef} type="file" accept="image/*,application/pdf" className="hidden"
+                 onChange={(e) => handleFile(e.target.files?.[0])} />
+          <button onClick={() => inputRef.current?.click()} disabled={busy}
+                  className="px-6 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50">
+            {busy ? 'Processing…' : 'Choose file'}
+          </button>
+          <p className="text-xs text-gray-400 mt-3">…or drop a file here</p>
+          {error && <div className="mt-4 text-sm text-red-600">{error}</div>}
+        </div>
+        <SavedProjectsList />
+      </div>
+    );
+  }
+  if (step === 'region') {
+    return (
+      <div className="flex-1 flex flex-col">
+        <div className="bg-white border-b px-3 py-2 flex items-center gap-2 flex-wrap">
+          <div className="mr-auto text-sm">
+            <strong>Select scan area</strong>
+            <span className="text-gray-500 ml-2">Drag to limit the area, or scan the whole image.</span>
+          </div>
+          <button onClick={() => setRegion(null)} className="px-3 py-1.5 text-xs border border-gray-300 rounded bg-white hover:bg-gray-50">Clear region</button>
+          <button onClick={() => runDetection(false)} disabled={busy}
+                  className="px-3 py-1.5 text-xs border border-blue-600 text-blue-600 rounded bg-white hover:bg-blue-50 disabled:opacity-50">
+            Scan whole image
+          </button>
+          <button onClick={() => runDetection(true)} disabled={!region || busy}
+                  className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50">
+            {busy ? 'Working…' : 'Scan region'}
+          </button>
+        </div>
+        <ScanRegionSelector imageSrc={previewUrl} imageWidth={imgDims.w} imageHeight={imgDims.h}
+                            region={region} onChangeRegion={setRegion} />
+        {error && <div className="p-3 text-sm text-red-600">{error}</div>}
+      </div>
+    );
+  }
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center">
+      <div className="bg-white rounded-xl shadow p-6 min-w-[380px]">
+        <h5 className="mb-3 font-semibold text-center">Reading booth labels…</h5>
+        <div className="h-3 bg-gray-100 rounded overflow-hidden">
+          <div className="h-3 bg-blue-500 transition-all" style={{ width: progressPct + '%' }} />
+        </div>
+        <div className="text-xs text-gray-500 mt-2 text-center">
+          OCR'd {ocrProgress.done} / {ocrProgress.total} booths
+          {ocrProgress.label && <> — last read: <code>{ocrProgress.label}</code></>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================
+// SECTION 5: Admin components
+// =====================================================================
+// -------- Sponsor import: normalise arbitrary JSON into our sponsor shape --------
+// Given the parsed response body, try to locate an array of sponsor-like objects
+// (top-level array, or wrapped in { data | sponsors | items | results | ... }).
+function findSponsorArray(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return null;
+  const keys = ['data', 'sponsors', 'items', 'results', 'records', 'exhibitors'];
+  for (const k of keys) if (Array.isArray(payload[k])) return payload[k];
+  // Look one level deeper for a common wrapper like { data: { sponsors: [...] } }
+  for (const k of Object.keys(payload)) {
+    const v = payload[k];
+    if (v && typeof v === 'object') {
+      for (const k2 of keys) if (Array.isArray(v[k2])) return v[k2];
+    }
+  }
+  return null;
+}
+// Case-insensitive picker across a list of candidate field names.
+function pickField(obj, candidates) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  const map = Object.fromEntries(Object.keys(obj).map(k => [k.toLowerCase(), k]));
+  for (const c of candidates) {
+    const real = map[c.toLowerCase()];
+    if (real !== undefined) {
+      const v = obj[real];
+      if (v !== null && v !== '' && v !== undefined) return v;
+    }
+  }
+  return undefined;
+}
+function mapImportedSponsors(rawArray, existingLevels) {
+  const generalLevel = existingLevels.find(l => l.name.toLowerCase() === 'general') || existingLevels[0];
+  return rawArray.map((raw, i) => {
+    const name = pickField(raw, ['name', 'companyName', 'company_name', 'title', 'exhibitorName', 'displayName']) || `Sponsor ${i+1}`;
+    const logo = pickField(raw, ['logoUrl', 'logo_url', 'logo', 'image', 'imageUrl', 'image_url', 'thumbnail', 'thumbnailUrl']);
+    const site = pickField(raw, ['website', 'websiteUrl', 'website_url', 'url', 'homepage', 'link', 'profileUrl', 'profile_url']);
+    const dbl  = pickField(raw, ['isDoubleBooth', 'is_double_booth', 'doubleBooth', 'double_booth']);
+    const lvl  = pickField(raw, ['level', 'levelName', 'category', 'tier', 'sponsorLevel', 'sponsorship_level']);
+    let levelId = generalLevel?.id;
+    if (typeof lvl === 'string') {
+      const match = existingLevels.find(l => l.name.toLowerCase() === lvl.toLowerCase());
+      if (match) levelId = match.id;
+    }
+    return {
+      id: uid(),
+      name: String(name),
+      levelId,
+      isDoubleBooth: !!dbl,
+      position: i,
+      logoUrl: logo ? String(logo)
+        : `https://ui-avatars.com/api/?name=${encodeURIComponent(String(name))}&background=3B82F6&color=fff&size=128&font-size=0.4&bold=true&rounded=true`,
+      website: site ? String(site) : null,
+    };
+  });
+}
+
+// -------- Sponsor import: parse arbitrary event-page HTML into sponsor cards --------
+// Handles WBR-style sponsor pages and other common event-website layouts. Tries
+// several selector strategies to locate repeated sponsor blocks, then extracts
+// name / logo / website / description from each.
+function parseSponsorsFromHtml(htmlString, baseUrl) {
+  const doc = new DOMParser().parseFromString(htmlString, 'text/html');
+  const resolveUrl = (href) => {
+    if (!href) return '';
+    try { return new URL(href, baseUrl || doc.baseURI || 'https://example.com/').href; }
+    catch { return href; }
+  };
+
+  // Strategy list — try selectors from most specific to broadest until we
+  // find a set of at least 3 repeated blocks (arbitrary heuristic: below that
+  // is probably navigation / decorative markup).
+  const strategies = [
+    '.sponsor, .sponsors > *',
+    '.exhibitor, .exhibitors > *',
+    '[class*="sponsor-card"]',
+    '[class*="sponsor"]',
+    '[class*="exhibitor"]',
+    '[class*="partner"]',
+    '.card',
+    'article',
+    '.item',
+    '.grid > div',
+    'li',
+  ];
+  let cards = [];
+  for (const sel of strategies) {
+    const found = Array.from(doc.querySelectorAll(sel))
+      .filter(el => el.querySelector('img, a, h1, h2, h3, h4, h5, h6'));
+    if (found.length >= 3) { cards = found; break; }
+  }
+
+  // Last-ditch: pair each heading with its nearest ancestor container.
+  if (!cards.length) {
+    const heads = Array.from(doc.querySelectorAll('h2, h3, h4'))
+      .filter(h => h.textContent.trim() && !/read more|sponsors?|exhibitors?/i.test(h.textContent.trim()));
+    cards = heads.map(h => h.closest('article, section, li, div') || h.parentElement).filter(Boolean);
+    // De-dup — the .closest() often returns the same container for siblings
+    cards = Array.from(new Set(cards));
+  }
+
+  const out = [];
+  const seenNames = new Set();
+  for (const card of cards) {
+    // Name — first heading; else first prominent link text; else <strong>
+    const nameEl = card.querySelector('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="name"]')
+      || card.querySelector('a[href] strong, a[href] b')
+      || card.querySelector('a[href]');
+    let name = (nameEl?.textContent || '').trim().replace(/\s+/g, ' ');
+    if (!name || /read more|learn more|view profile/i.test(name)) continue;
+    if (name.length > 120) name = name.slice(0, 120);
+
+    // Logo — prefer <img> with logo-ish class/alt; else first <img>
+    const imgs = Array.from(card.querySelectorAll('img'));
+    const logoImg = imgs.find(img => /logo|brand/i.test((img.className || '') + ' ' + (img.alt || ''))) || imgs[0];
+    let logo = logoImg?.getAttribute('src') || logoImg?.getAttribute('data-src') || '';
+    // Some sites lazy-load via srcset — take the first url
+    if (!logo && logoImg?.getAttribute('srcset')) {
+      logo = logoImg.getAttribute('srcset').split(',')[0].trim().split(' ')[0];
+    }
+    if (logo) logo = resolveUrl(logo);
+
+    // Website / profile — prefer an external link; else the profile-page link
+    const links = Array.from(card.querySelectorAll('a[href]'))
+      .map(a => a.getAttribute('href'))
+      .filter(Boolean);
+    let external = links.find(h => /^https?:\/\//i.test(h) && !h.includes((baseUrl || '').replace(/^https?:\/\//, '').split('/')[0]));
+    let internalProfile = links.find(h => /sponsor|exhibitor|profile|partner/i.test(h));
+    const website = external ? resolveUrl(external) : (internalProfile ? resolveUrl(internalProfile) : (links[0] ? resolveUrl(links[0]) : ''));
+
+    // Description — first paragraph text within the card, trimmed
+    const descEl = card.querySelector('p, [class*="desc"], .summary');
+    const description = descEl ? descEl.textContent.trim().replace(/\s+/g, ' ').slice(0, 500) : '';
+
+    // Skip duplicates
+    const key = name.toLowerCase();
+    if (seenNames.has(key)) continue;
+    seenNames.add(key);
+
+    out.push({ name, logoUrl: logo, website, description });
+  }
+  return out;
+}
+
+// A couple of public CORS proxies to try when direct fetch fails. These are
+// third-party services — fine for demos, but for production you'd want your
+// CMS to proxy the request server-side.
+async function fetchWithCorsFallback(url, headers = {}) {
+  // 1) Direct
+  try {
+    const r = await fetch(url, { headers, credentials: 'omit' });
+    if (r.ok) return await r.text();
+  } catch (_) { /* CORS or network */ }
+  // 2) Public CORS proxies
+  const proxies = [
+    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+  ];
+  let lastErr = null;
+  for (const build of proxies) {
+    try {
+      const r = await fetch(build(url), { credentials: 'omit' });
+      if (r.ok) return await r.text();
+      lastErr = new Error(`Proxy HTTP ${r.status}`);
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('All fetch attempts failed');
+}
+
+function SponsorImportModal({ onClose }) {
+  const store = useStore();
+  const [tab, setTab] = useState('url'); // 'url' | 'paste' | 'siteUrl' | 'siteHtml'
+  const [url, setUrl] = useState('https://api.iqpc.com/api/v2/event/6879132f670da3225a72b4e2/sponsors?modified_date=2026-05-17T18:19:35');
+  const [headers, setHeaders] = useState('');
+  const [pasteText, setPasteText] = useState('');
+  const [siteUrl, setSiteUrl] = useState('https://etaileast.wbresearch.com/sponsors');
+  const [siteHtml, setSiteHtml] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [preview, setPreview] = useState(null); // {mapped, raw}
+
+  const parseHeaders = () => {
+    // Lines like "Authorization: Bearer xxx"
+    const out = {};
+    headers.split(/\r?\n/).forEach(line => {
+      const m = line.match(/^\s*([^:]+):\s*(.+)\s*$/);
+      if (m) out[m[1].trim()] = m[2].trim();
+    });
+    return out;
+  };
+
+  const runFetch = async () => {
+    setLoading(true); setError(''); setPreview(null);
+    try {
+      const res = await fetch(url, { headers: parseHeaders(), credentials: 'omit' });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const body = await res.json();
+      handleParsed(body);
+    } catch (e) {
+      let msg = e.message || String(e);
+      if (/Failed to fetch|NetworkError|CORS/i.test(msg)) {
+        msg += ' — the API likely doesn\'t send CORS headers for browser requests. Try pasting the JSON response directly in the "Paste JSON" tab.';
+      }
+      setError(msg);
+    } finally { setLoading(false); }
+  };
+
+  const runParsePaste = () => {
+    setError(''); setPreview(null);
+    try {
+      const body = JSON.parse(pasteText);
+      handleParsed(body);
+    } catch (e) {
+      setError('Could not parse JSON: ' + (e.message || String(e)));
+    }
+  };
+
+  const handleParsed = (body) => {
+    const arr = findSponsorArray(body);
+    if (!arr) {
+      setError('Could not find a sponsor array in the response. Expected top-level array, or a { data | sponsors | items | results } wrapper.');
+      return;
+    }
+    const mapped = mapImportedSponsors(arr, store.levels);
+    setPreview({ mapped, raw: arr });
+  };
+
+  // Convert scraped {name, logoUrl, website, description} entries into our
+  // sponsor model. Reuses the JSON mapper for consistent shape.
+  const handleScraped = (scraped) => {
+    if (!scraped.length) {
+      setError('No sponsor blocks were found in the HTML. If the page uses uncommon markup, try Paste HTML mode and confirm the source contains repeated sponsor cards, or send me the URL and I\'ll tune the selectors.');
+      return;
+    }
+    const mapped = mapImportedSponsors(scraped, store.levels);
+    setPreview({ mapped, raw: scraped });
+  };
+
+  const runScrapeUrl = async () => {
+    setLoading(true); setError(''); setPreview(null);
+    try {
+      const html = await fetchWithCorsFallback(siteUrl);
+      handleScraped(parseSponsorsFromHtml(html, siteUrl));
+    } catch (e) {
+      setError(
+        (e.message || String(e)) +
+        ' — the page likely blocks browser-side requests and no public CORS proxy responded. Copy the page source (right-click → View Page Source, Cmd+A, Cmd+C) and use Paste HTML instead.'
+      );
+    } finally { setLoading(false); }
+  };
+  const runParseHtml = () => {
+    setError(''); setPreview(null);
+    handleScraped(parseSponsorsFromHtml(siteHtml, siteUrl));
+  };
+
+  const doImport = () => {
+    if (!preview) return;
+    if (!confirm(`Replace all ${store.sponsors.length} sponsors with ${preview.mapped.length} imported sponsors? Any existing booth assignments to sponsors that don't match will be cleared.`)) return;
+    store.replaceSponsors(preview.mapped);
+    onClose();
+  };
+
+  return (
+    <Modal onClose={onClose} size="xl">
+      <div className="px-5 py-4 border-b border-gray-200 flex items-center gap-2">
+        <h3 className="text-lg font-semibold text-gray-900">Import sponsors</h3>
+        <button onClick={onClose} className="ml-auto text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+      </div>
+
+      <div className="px-5 py-3 border-b border-gray-100">
+        <div className="inline-flex rounded overflow-hidden border border-gray-300 text-xs flex-wrap">
+          <button onClick={() => setTab('url')}
+                  className={`px-3 py-1 ${tab === 'url' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
+            API URL
+          </button>
+          <button onClick={() => setTab('paste')}
+                  className={`px-3 py-1 ${tab === 'paste' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
+            Paste JSON
+          </button>
+          <button onClick={() => setTab('siteUrl')}
+                  className={`px-3 py-1 ${tab === 'siteUrl' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
+            Website URL
+          </button>
+          <button onClick={() => setTab('siteHtml')}
+                  className={`px-3 py-1 ${tab === 'siteHtml' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
+            Paste HTML
+          </button>
+        </div>
+      </div>
+
+      {tab === 'url' && (
+        <div className="px-5 py-4 space-y-3">
+          <div>
+            <label className="text-xs text-gray-600 block">API URL</label>
+            <input value={url} onChange={(e) => setUrl(e.target.value)}
+                   className="w-full text-sm border border-gray-300 rounded px-2 py-1 font-mono" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-600 block">
+              Headers (optional, one per line, e.g. <code>Authorization: Bearer …</code>)
+            </label>
+            <textarea value={headers} onChange={(e) => setHeaders(e.target.value)} rows={2}
+                      placeholder="Authorization: Bearer <token>"
+                      className="w-full text-xs border border-gray-300 rounded px-2 py-1 font-mono" />
+          </div>
+          <button onClick={runFetch} disabled={loading || !url}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-40">
+            {loading ? 'Fetching…' : 'Fetch and preview'}
+          </button>
+          <div className="text-xs text-gray-500">
+            Browser-side fetch will only work if the API responds with CORS headers permitting your origin.
+            For servers that don't (most private APIs), use the <em>Paste JSON</em> tab.
+          </div>
+        </div>
+      )}
+
+      {tab === 'paste' && (
+        <div className="px-5 py-4 space-y-3">
+          <div>
+            <label className="text-xs text-gray-600 block">Paste JSON response</label>
+            <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} rows={10}
+                      placeholder='[{"name":"Acme","logoUrl":"https://…","website":"https://…"}, …]'
+                      className="w-full text-xs border border-gray-300 rounded px-2 py-1 font-mono" />
+          </div>
+          <button onClick={runParsePaste} disabled={!pasteText.trim()}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-40">
+            Parse and preview
+          </button>
+        </div>
+      )}
+
+      {tab === 'siteUrl' && (
+        <div className="px-5 py-4 space-y-3">
+          <div>
+            <label className="text-xs text-gray-600 block">Sponsors page URL</label>
+            <input value={siteUrl} onChange={(e) => setSiteUrl(e.target.value)}
+                   className="w-full text-sm border border-gray-300 rounded px-2 py-1 font-mono" />
+          </div>
+          <button onClick={runScrapeUrl} disabled={loading || !siteUrl}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-40">
+            {loading ? 'Scraping…' : 'Fetch page & scrape sponsors'}
+          </button>
+          <div className="text-xs text-gray-500">
+            We try a direct fetch first, then fall back to a public CORS proxy (allorigins.win / corsproxy.io).
+            Public event pages usually work — pages behind auth or with strict CSP won't. If both fail, use <em>Paste HTML</em>.
+          </div>
+        </div>
+      )}
+
+      {tab === 'siteHtml' && (
+        <div className="px-5 py-4 space-y-3">
+          <div>
+            <label className="text-xs text-gray-600 block">
+              Source page URL <span className="text-gray-400">(used to resolve relative logo / link URLs)</span>
+            </label>
+            <input value={siteUrl} onChange={(e) => setSiteUrl(e.target.value)}
+                   className="w-full text-sm border border-gray-300 rounded px-2 py-1 font-mono" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-600 block">Paste full page HTML source</label>
+            <textarea value={siteHtml} onChange={(e) => setSiteHtml(e.target.value)} rows={10}
+                      placeholder="Right-click the sponsors page → View Page Source → Cmd+A, Cmd+C → paste here"
+                      className="w-full text-xs border border-gray-300 rounded px-2 py-1 font-mono" />
+          </div>
+          <button onClick={runParseHtml} disabled={!siteHtml.trim()}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-40">
+            Parse HTML & preview
+          </button>
+          <div className="text-xs text-gray-500">
+            Parser looks for repeated sponsor cards using common event-page selectors
+            (<code>.sponsor</code>, <code>.exhibitor</code>, <code>[class*=&quot;sponsor&quot;]</code>, <code>.card</code>, <code>article</code>, etc.),
+            then extracts name (heading), logo (<code>&lt;img&gt;</code>), and website link from each.
+          </div>
+        </div>
+      )}
+
+      {error && <div className="mx-5 mb-3 p-3 rounded bg-red-50 border border-red-200 text-sm text-red-800">{error}</div>}
+
+      {preview && (
+        <div className="px-5 pb-4">
+          <div className="text-sm mb-2">
+            Detected <strong>{preview.mapped.length}</strong> sponsors. Preview (first 5):
+          </div>
+          <div className="border border-gray-200 rounded overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-gray-50 text-gray-600">
+                <tr>
+                  <th className="text-left px-2 py-1">Logo</th>
+                  <th className="text-left px-2 py-1">Name</th>
+                  <th className="text-left px-2 py-1">Category</th>
+                  <th className="text-left px-2 py-1">Website</th>
+                  <th className="text-left px-2 py-1">Double?</th>
+                </tr>
+              </thead>
+              <tbody>
+                {preview.mapped.slice(0, 5).map(sp => (
+                  <tr key={sp.id} className="border-t border-gray-100">
+                    <td className="px-2 py-1">
+                      {sp.logoUrl ? <img src={sp.logoUrl} alt="" className="w-6 h-6 rounded-full" /> : '—'}
+                    </td>
+                    <td className="px-2 py-1">{sp.name}</td>
+                    <td className="px-2 py-1">{store.levelById[sp.levelId]?.name || '—'}</td>
+                    <td className="px-2 py-1 truncate max-w-[180px]">
+                      {sp.website ? <a href={sp.website} target="_blank" rel="noopener" className="text-blue-600 hover:underline">{sp.website}</a> : '—'}
+                    </td>
+                    <td className="px-2 py-1">{sp.isDoubleBooth ? '✓' : ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-3 text-xs text-gray-500">
+            Field mapping is auto-detected across common names
+            (<code>name/companyName/title</code>, <code>logo/logoUrl/image</code>,
+            <code>website/url/homepage</code>, <code>isDoubleBooth/doubleBooth</code>,
+            <code>level/category/tier</code>). Anything that doesn't map cleanly falls back to sensible defaults.
+          </div>
+        </div>
+      )}
+
+      <div className="px-5 py-3 border-t border-gray-200 flex justify-end gap-2">
+        <button onClick={onClose} className="px-3 py-1.5 text-sm text-gray-600 hover:text-gray-900">Cancel</button>
+        <button onClick={doImport} disabled={!preview}
+                className="px-3 py-1.5 text-sm bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:opacity-40">
+          Import {preview ? `${preview.mapped.length} sponsors` : ''}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function AssignSponsorModal({ booth, onClose }) {
+  const store = useStore();
+  const [error, setError] = useState('');
+  const level = store.levelById[booth.levelId];
+  const candidates = store.unassignedSponsorsAtLevel(booth.levelId);
+
+  const onAssign = (sp) => {
+    if (sp.isDoubleBooth) {
+      const partner = findAdjacentEmpty(booth, store.booths);
+      if (!partner) {
+        setError(`${sp.name} requires a double booth, but no adjacent empty same-category booth was found. Pick a different booth first.`);
+        return;
+      }
+    }
+    store.assignSponsor(booth.id, sp.id);
+    onClose();
+  };
+
+  return (
+    <Modal onClose={onClose}>
+      <div className="px-5 py-4 border-b border-gray-200">
+        <div className="flex items-center gap-2">
+          <span className="inline-block w-3 h-3 rounded-sm" style={{ background: level?.color }} />
+          <span className="text-xs uppercase tracking-wide text-gray-500">{level?.name}</span>
+        </div>
+        <h3 className="text-lg font-semibold text-gray-900 mt-1">Assign sponsor to booth {booth.label}</h3>
+      </div>
+      {error && <div className="mx-5 mt-3 p-3 rounded bg-amber-50 border border-amber-200 text-sm text-amber-800">{error}</div>}
+      <div className="max-h-[50vh] overflow-y-auto scroll-thin">
+        {candidates.length === 0 && (
+          <div className="px-5 py-8 text-center text-sm text-gray-500">
+            No unassigned sponsors at <strong>{level?.name}</strong>.
+          </div>
+        )}
+        {candidates.map(sp => (
+          <button key={sp.id} onClick={() => onAssign(sp)}
+                  className="w-full text-left px-5 py-3 border-b border-gray-100 hover:bg-blue-50 flex items-center gap-3">
+            {store.settings.showSponsorLogos && sp.logoUrl && (
+              <img src={sp.logoUrl} alt="" className="w-8 h-8 rounded-full" />
+            )}
+            <span className="flex-1 text-sm text-gray-900">{sp.name}</span>
+            {sp.isDoubleBooth && (
+              <span className="text-[10px] uppercase font-semibold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">
+                Needs 2 adj.
+              </span>
+            )}
+            <span className="text-xs text-blue-600">Assign →</span>
+          </button>
+        ))}
+      </div>
+      <div className="px-5 py-3 border-t border-gray-200 flex justify-end">
+        <button onClick={onClose} className="px-3 py-1.5 text-sm text-gray-600 hover:text-gray-900">Cancel</button>
+      </div>
+    </Modal>
+  );
+}
+
+function BoothEditPopup({ booth, onClose, onOpenAssign }) {
+  const store = useStore();
+  const live = store.boothById[booth.id] || booth;
+  const [label, setLabel] = useState(live.label);
+  const [levelId, setLevelId] = useState(live.levelId);
+  useEffect(() => { setLabel(live.label); setLevelId(live.levelId); }, [live.id, live.label, live.levelId]);
+  const dirty = label !== live.label || levelId !== live.levelId;
+
+  const sponsor = live.sponsorId ? store.sponsorById[live.sponsorId] : null;
+  const partner = live.partnerBoothId ? store.boothById[live.partnerBoothId] : null;
+  const level = store.levelById[live.levelId];
+
+  return (
+    <Modal onClose={onClose}>
+      <div className="px-5 py-4 border-b border-gray-200 flex items-center gap-2">
+        <span className="inline-block w-3 h-3 rounded-sm" style={{ background: level?.color }} />
+        <h3 className="text-lg font-semibold text-gray-900">Booth {live.label}</h3>
+        <button onClick={onClose} className="ml-auto text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+      </div>
+      <div className="px-5 py-4 space-y-3">
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-xs text-gray-500 block">Label</label>
+            <input value={label} onChange={(e) => setLabel(e.target.value)}
+                   className="w-full text-sm border border-gray-300 rounded px-2 py-1" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 block">Category</label>
+            <select value={levelId} onChange={(e) => setLevelId(e.target.value)}
+                    className="w-full text-sm border border-gray-300 rounded px-2 py-1">
+              {store.levels.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+            </select>
+          </div>
+        </div>
+        {sponsor && (
+          <div className="p-3 rounded bg-gray-50 border border-gray-200">
+            <div className="text-xs text-gray-500">Currently assigned</div>
+            <div className="flex items-center gap-2 mt-1">
+              {store.settings.showSponsorLogos && sponsor.logoUrl && (
+                <img src={sponsor.logoUrl} alt="" className="w-8 h-8 rounded-full" />
+              )}
+              <strong className="text-sm">{sponsor.name}</strong>
+              {sponsor.isDoubleBooth && (
+                <span className="text-[10px] uppercase font-semibold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">2× double</span>
+              )}
+              {live.locked && <span className="ml-auto text-xs text-amber-600">🔒 locked</span>}
+            </div>
+            {partner && <div className="text-xs text-gray-500 mt-1">Paired with booth <code>{partner.label}</code></div>}
+          </div>
+        )}
+        <div className="flex gap-2">
+          <button onClick={() => onOpenAssign(live)}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700">
+            {live.sponsorId ? 'Reassign sponsor' : 'Assign sponsor'}
+          </button>
+          {live.sponsorId && (
+            <button onClick={() => store.unassignBooth(live.id)}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white hover:bg-gray-50">
+              Unassign
+            </button>
+          )}
+          <button onClick={() => { if (confirm(`Delete booth ${live.label}?`)) { store.deleteBooth(live.id); onClose(); } }}
+                  className="ml-auto px-3 py-1.5 text-sm border border-red-200 text-red-600 rounded hover:bg-red-50">
+            Delete booth
+          </button>
+        </div>
+      </div>
+      <div className="px-5 py-3 border-t border-gray-200 flex justify-end gap-2">
+        <button onClick={onClose} className="px-3 py-1.5 text-sm text-gray-600 hover:text-gray-900">Close</button>
+        <button onClick={() => { store.updateBooth(live.id, { label, levelId }); onClose(); }}
+                disabled={!dirty}
+                className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-40">
+          Save changes
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function ReDetectBoothsModal({ onClose }) {
+  const store = useStore();
+  const [step, setStep] = useState('loading');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [imageEl, setImageEl] = useState(null);
+  const [region, setRegion] = useState(null);
+  const [ocrProgress, setOcrProgress] = useState({ done: 0, total: 0, label: '' });
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const img = await loadImage(store.floorPlan.dataUrl);
+        if (cancelled) return;
+        setImageEl(img);
+        setStep('region');
+      } catch (e) {
+        setError('Could not load the current floor plan image.');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const run = async (useRegion) => {
+    setBusy(true); setError('');
+    try {
+      const rects = detectBoothRects(imageEl, useRegion ? region : null);
+      let labelled = [];
+      if (rects.length) {
+        setStep('ocr');
+        setOcrProgress({ done: 0, total: rects.length, label: '' });
+        labelled = await labelRectsWithOcr(imageEl, rects, (p) => setOcrProgress({ ...p }));
+      }
+      store.saveDetectedBooths(labelled);
+      if (!labelled.length) {
+        setError('No booth squares detected in that area. Try a smaller region around one row of booths, or use "+ Add" in the sidebar.');
+        setStep('region');
+        return;
+      }
+      onClose();
+    } catch (e) {
+      setError(e.message || String(e));
+      setStep('region');
+    } finally { setBusy(false); }
+  };
+
+  const progressPct = ocrProgress.total ? Math.round((ocrProgress.done / ocrProgress.total) * 100) : 0;
+
+  return (
+    <Modal onClose={busy ? undefined : onClose} size="full" backdropClose={!busy}>
+      <div className="flex flex-col" style={{ height: '85vh' }}>
+        <div className="px-5 py-3 border-b flex items-center gap-2">
+          <h3 className="text-lg font-semibold">Re-run auto-detect</h3>
+          <button onClick={onClose} disabled={busy} className="ml-auto text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+        </div>
+        {step === 'loading' && (
+          <div className="flex-1 flex items-center justify-center text-gray-500">Loading floor plan…</div>
+        )}
+        {step === 'region' && imageEl && (
+          <>
+            <div className="bg-white border-b px-3 py-2 flex items-center gap-2 flex-wrap">
+              <div className="mr-auto text-sm">
+                <strong>Select scan area</strong>
+                <span className="text-gray-500 ml-2">Existing booths will be replaced.</span>
+              </div>
+              <button onClick={() => setRegion(null)} className="px-3 py-1.5 text-xs border border-gray-300 rounded bg-white hover:bg-gray-50">Clear region</button>
+              <button onClick={() => run(false)} disabled={busy}
+                      className="px-3 py-1.5 text-xs border border-blue-600 text-blue-600 rounded bg-white hover:bg-blue-50 disabled:opacity-50">
+                Scan whole image
+              </button>
+              <button onClick={() => run(true)} disabled={!region || busy}
+                      className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50">
+                Scan region
+              </button>
+            </div>
+            <ScanRegionSelector imageSrc={store.floorPlan.dataUrl}
+                                imageWidth={imageEl.naturalWidth} imageHeight={imageEl.naturalHeight}
+                                region={region} onChangeRegion={setRegion} />
+          </>
+        )}
+        {step === 'ocr' && (
+          <div className="flex-1 flex flex-col items-center justify-center">
+            <h5 className="mb-3 font-semibold">Reading booth labels…</h5>
+            <div className="w-1/2 h-3 bg-gray-100 rounded overflow-hidden">
+              <div className="h-3 bg-blue-500 transition-all" style={{ width: progressPct + '%' }} />
+            </div>
+            <div className="text-xs text-gray-500 mt-2">
+              OCR'd {ocrProgress.done} / {ocrProgress.total} booths
+              {ocrProgress.label && <> — last read: <code>{ocrProgress.label}</code></>}
+            </div>
+          </div>
+        )}
+        {error && <div className="mx-3 mb-3 p-3 rounded bg-red-50 border border-red-200 text-sm text-red-800">{error}</div>}
+      </div>
+    </Modal>
+  );
+}
+
+function SponsorRow({ sponsor, index, level, reorderable, onDragStart, onDragOver, onDrop, onDragEnd, dragging, dragOver }) {
+  const store = useStore();
+  const myBooth = store.booths.find(b => b.sponsorId === sponsor.id);
+  return (
+    <div className={`rounded border bg-white text-sm flex items-center gap-2 px-2 py-1.5
+                     ${dragging ? 'opacity-40' : ''}
+                     ${dragOver ? 'border-t-2 border-t-blue-500' : 'border-gray-200'}`}
+         draggable={reorderable}
+         onDragStart={(e) => onDragStart(e, sponsor)}
+         onDragOver={(e) => { e.preventDefault(); onDragOver(sponsor); }}
+         onDrop={(e) => { e.preventDefault(); onDrop(); }}
+         onDragEnd={onDragEnd}>
+      {reorderable && <span className="text-gray-400 cursor-grab" title="Drag to reorder">⋮⋮</span>}
+      <span className="text-[10px] font-mono text-gray-500 w-5 text-center">{index + 1}</span>
+      {store.settings.showSponsorLogos && sponsor.logoUrl && (
+        <img src={sponsor.logoUrl} alt="" className="w-5 h-5 rounded-full" />
+      )}
+      <span className="flex-1 truncate">
+        {sponsor.name}
+        {sponsor.isDoubleBooth && (
+          <span className="text-[9px] uppercase ml-1 font-semibold text-amber-700 bg-amber-100 px-1 py-0.5 rounded">2×</span>
+        )}
+      </span>
+      {myBooth
+        ? <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${myBooth.locked ? 'bg-emerald-100 text-emerald-800' : 'bg-blue-100 text-blue-800'}`}>
+            {myBooth.locked ? '🔒 ' : ''}{myBooth.label}
+          </span>
+        : <span className="text-[10px] text-gray-400 italic">unassigned</span>}
+      <button onClick={() => store.updateSponsor(sponsor.id, { isDoubleBooth: !sponsor.isDoubleBooth })}
+              className="text-gray-400 hover:text-amber-700 p-0.5"
+              title={sponsor.isDoubleBooth ? 'Remove double-booth flag' : 'Mark as double-booth'}>
+        {sponsor.isDoubleBooth ? '⊞' : '⊡'}
+      </button>
+    </div>
+  );
+}
+
+function LevelGroup({ level, mode, onOpenAssign, selectedBoothId, setSelectedBoothId }) {
+  const store = useStore();
+  const [flipped, setFlipped] = useState(false);
+  const [expandedBoothId, setExpandedBoothId] = useState(null);
+  const [dragId, setDragId] = useState(null);
+  const [dragOverId, setDragOverId] = useState(null);
+
+  const boothsHere = store.boothsAtLevel(level.id);
+  const sponsorsHere = store.sponsorsAtLevel(level.id);
+  const unassignedCount = store.unassignedSponsorsAtLevel(level.id).length;
+
+  const onDragStart = (e, sp) => { setDragId(sp.id); e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', sp.id); };
+  const onDragOver = (sp) => { if (dragId) setDragOverId(sp.id); };
+  const onDrop = () => {
+    if (!dragId || !dragOverId || dragId === dragOverId) return;
+    const ids = sponsorsHere.map(s => s.id);
+    const from = ids.indexOf(dragId), to = ids.indexOf(dragOverId);
+    if (from === -1 || to === -1) return;
+    const [moved] = ids.splice(from, 1);
+    ids.splice(to, 0, moved);
+    store.reorderSponsors(level.id, ids);
+    setDragId(null); setDragOverId(null);
+  };
+  const onDragEnd = () => { setDragId(null); setDragOverId(null); };
+
+  return (
+    <div className="border-b border-gray-100">
+      <div className="px-4 py-2 bg-gray-50 flex items-center gap-2">
+        <input type="color" value={level.color}
+               onChange={(e) => store.updateLevel(level.id, { color: e.target.value })}
+               className="w-6 h-6 rounded border border-gray-300 cursor-pointer" />
+        <input value={level.name}
+               onChange={(e) => store.updateLevel(level.id, { name: e.target.value })}
+               className="flex-1 bg-transparent text-sm font-semibold text-gray-900 focus:outline-none focus:bg-white px-1 rounded" />
+        <span className="text-xs text-gray-500">{flipped ? unassignedCount : boothsHere.length}</span>
+        {store.levels.length > 1 && (
+          <button onClick={() => confirm(`Delete category "${level.name}"? Booths and sponsors in this category will move to another category.`) && store.deleteLevel(level.id)}
+                  className="text-gray-300 hover:text-red-600 text-xs">×</button>
+        )}
+      </div>
+      <div className="px-4 py-2">
+        <button onClick={() => setFlipped(f => !f)}
+                className="text-xs text-blue-600 hover:underline mb-2 flex items-center gap-1">
+          {flipped ? '← View Booths' : `View Unassigned (${unassignedCount}) →`}
+          {store.settings.enforceSelectionOrder && flipped && (
+            <span className="ml-auto text-[10px] font-semibold text-cyan-700 bg-cyan-50 px-1.5 py-0.5 rounded">↕ Order</span>
+          )}
+        </button>
+
+        {!flipped && (
+          <div className="space-y-1">
+            {boothsHere.length === 0 && (
+              <div className="text-xs text-gray-400 italic py-1">No booths in this category.</div>
+            )}
+            {boothsHere.map(b => {
+              const sponsor = b.sponsorId ? store.sponsorById[b.sponsorId] : null;
+              const expanded = expandedBoothId === b.id;
+              return (
+                <div key={b.id} className={`rounded border text-sm ${selectedBoothId === b.id ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-white'}`}>
+                  <div className="px-2 py-1.5 cursor-pointer flex items-center gap-2"
+                       onClick={() => { setSelectedBoothId(b.id); setExpandedBoothId(expanded ? null : b.id); }}>
+                    <span className="inline-block w-3 h-3 rounded-sm" style={{ background: level.color }} />
+                    <input value={b.label}
+                           onClick={(e) => e.stopPropagation()}
+                           onChange={(e) => store.updateBooth(b.id, { label: e.target.value })}
+                           className="font-mono text-xs w-16 px-1 py-0.5 rounded bg-gray-50 focus:bg-white border border-transparent focus:border-gray-300" />
+                    <span className="text-xs text-gray-600 flex-1 truncate flex items-center gap-1">
+                      {sponsor ? (
+                        <>
+                          {store.settings.showSponsorLogos && sponsor.logoUrl && (
+                            <img src={sponsor.logoUrl} alt="" className="w-4 h-4 rounded-full" />
+                          )}
+                          {sponsor.name}
+                          {sponsor.isDoubleBooth && (
+                            <span className="text-[9px] uppercase font-semibold text-amber-700 bg-amber-100 px-1 py-0.5 rounded">2×</span>
+                          )}
+                        </>
+                      ) : <em className="text-gray-400">unassigned</em>}
+                    </span>
+                    {b.locked && <span title="Locked" className="text-amber-600 text-xs">🔒</span>}
+                  </div>
+                  {expanded && (
+                    <div className="px-2 pb-2 space-y-1.5">
+                      <div className="flex items-center gap-1 text-xs text-gray-600">
+                        <span>Category:</span>
+                        <select value={b.levelId}
+                                onChange={(e) => store.updateBooth(b.id, { levelId: e.target.value })}
+                                className="flex-1 text-xs border border-gray-300 rounded px-1 py-0.5">
+                          {store.levels.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+                        </select>
+                      </div>
+                      <div className="flex gap-1">
+                        <button onClick={() => onOpenAssign(b)}
+                                className="text-xs px-2 py-1 border border-blue-600 text-blue-600 rounded hover:bg-blue-50">
+                          {b.sponsorId ? 'Reassign' : 'Assign'}
+                        </button>
+                        {b.sponsorId && (
+                          <button onClick={() => store.unassignBooth(b.id)}
+                                  className="text-xs px-2 py-1 border border-gray-300 rounded hover:bg-gray-50">
+                            Unassign
+                          </button>
+                        )}
+                        <button onClick={() => { if (confirm(`Delete booth ${b.label}?`)) { store.deleteBooth(b.id); setExpandedBoothId(null); } }}
+                                className="text-xs px-2 py-1 border border-red-200 text-red-600 rounded hover:bg-red-50 ml-auto">
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {flipped && (
+          <div className="space-y-1">
+            {sponsorsHere.length === 0 && (
+              <div className="text-xs text-gray-400 italic py-1">No sponsors in this category.</div>
+            )}
+            {sponsorsHere.map((sp, i) => (
+              <SponsorRow key={sp.id} sponsor={sp} index={i} level={level}
+                          reorderable={store.settings.enforceSelectionOrder}
+                          dragging={dragId === sp.id} dragOver={dragOverId === sp.id}
+                          onDragStart={onDragStart} onDragOver={onDragOver}
+                          onDrop={onDrop} onDragEnd={onDragEnd} />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AdminSidebar({ mode, setMode, onOpenAssign, onReupload, onReDetect, onImportSponsors, selectedBoothId, setSelectedBoothId }) {
+  const store = useStore();
+  const [collapsed, setCollapsed] = useState(false);
+  if (collapsed) {
+    return (
+      <div className="bg-white border-r border-gray-200 p-2 flex flex-col items-center gap-2 flex-shrink-0">
+        <button onClick={() => setCollapsed(false)} className="w-8 h-8 rounded hover:bg-gray-100 flex items-center justify-center" title="Expand">›</button>
+      </div>
+    );
+  }
+  return (
+    <div className="bg-white border-r border-gray-200 w-80 flex flex-col flex-shrink-0">
+      <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+        <div className="font-semibold text-gray-900">Booths & Sponsors</div>
+        <button onClick={() => setCollapsed(true)} className="text-gray-400 hover:text-gray-700">‹</button>
+      </div>
+
+      <div className="px-4 py-3 border-b border-gray-200 space-y-2">
+        <div className="flex items-center gap-2">
+          <button onClick={() => setMode('select')}
+                  className={`flex-1 text-xs py-1.5 rounded border ${mode==='select' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-300'}`}>
+            Edit
+          </button>
+          <button onClick={() => setMode('edit')}
+                  className={`flex-1 text-xs py-1.5 rounded border ${mode==='edit' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-300'}`}>
+            Move/Resize
+          </button>
+          <button onClick={() => setMode('add')}
+                  className={`flex-1 text-xs py-1.5 rounded border ${mode==='add' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-300'}`}>
+            + Add
+          </button>
+        </div>
+        <button onClick={onReupload} className="w-full text-xs py-1.5 border border-gray-300 rounded bg-white hover:bg-gray-50">
+          ↻ Re-upload floor plan image
+        </button>
+        <button onClick={onReDetect} className="w-full text-xs py-1.5 border border-gray-300 rounded bg-white hover:bg-gray-50">
+          ⌘ Re-run auto-detect
+        </button>
+        <button onClick={onImportSponsors} className="w-full text-xs py-1.5 border border-gray-300 rounded bg-white hover:bg-gray-50">
+          ⇩ Import sponsors from API / JSON
+        </button>
+        <label className="flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
+          <input type="checkbox" checked={store.settings.showAssignmentsToSponsors}
+                 onChange={(e) => store.updateSettings({ showAssignmentsToSponsors: e.target.checked })} />
+          Display booth assignments to sponsors
+        </label>
+        <label className="flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
+          <input type="checkbox" checked={store.settings.showSponsorLogos}
+                 onChange={(e) => store.updateSettings({ showSponsorLogos: e.target.checked })} />
+          Display sponsor logo images
+        </label>
+        <label className="flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
+          <input type="checkbox" checked={store.settings.enforceSelectionOrder}
+                 onChange={(e) => store.updateSettings({ enforceSelectionOrder: e.target.checked })} />
+          Restrict booth selection to predefined order
+        </label>
+
+        <div className="pt-2 mt-1 border-t border-gray-100">
+          <div className="text-xs font-semibold text-gray-700 mb-1">Double booth orientation</div>
+          {[
+            ['vertical',    'Vertical only'],
+            ['horizontal',  'Horizontal only'],
+            ['user-toggle', 'User can toggle'],
+          ].map(([val, label]) => (
+            <label key={val} className="flex items-center gap-2 text-xs text-gray-700 cursor-pointer py-0.5">
+              <input type="radio" name="dbo"
+                     checked={store.settings.doubleBoothOrientation === val}
+                     onChange={() => store.updateSettings({ doubleBoothOrientation: val })} />
+              {label}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto scroll-thin">
+        {store.levels.map(level => (
+          <LevelGroup key={level.id} level={level} mode={mode}
+                      onOpenAssign={onOpenAssign}
+                      selectedBoothId={selectedBoothId} setSelectedBoothId={setSelectedBoothId} />
+        ))}
+        <div className="px-4 py-3">
+          <button onClick={store.createLevel}
+                  className="w-full text-xs py-1.5 border border-dashed border-gray-300 rounded text-gray-500 hover:bg-gray-50">
+            + Add Category
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdminFloorPlanCanvas({ selectedBoothId, setSelectedBoothId, mode, onOpenPopup }) {
+  const store = useStore();
+  const containerRef = useRef(null);
+  const [scale, setScale] = useState(1);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [panning, setPanning] = useState(null);
+  const [drag, setDrag] = useState(null);
+  const [drawing, setDrawing] = useState(null);
+
+  const { floorPlan, booths, levelById, sponsorById } = store;
+  const totalScale = scale * zoom;
+
+  useEffect(() => {
+    if (!containerRef.current || !floorPlan) return;
+    const fit = () => {
+      const r = containerRef.current.getBoundingClientRect();
+      const s = Math.min(r.width / floorPlan.width, r.height / floorPlan.height, 1);
+      setScale(s > 0 ? s : 1);
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [floorPlan]);
+
+  const screenToImage = (cx, cy) => {
+    const r = containerRef.current.getBoundingClientRect();
+    const centerX = r.left + r.width / 2 + pan.x;
+    const centerY = r.top + r.height / 2 + pan.y;
+    return {
+      x: (cx - centerX) / totalScale + floorPlan.width / 2,
+      y: (cy - centerY) / totalScale + floorPlan.height / 2,
+    };
+  };
+
+  // Drag booth
+  useEffect(() => {
+    if (!drag) return;
+    const onMove = (e) => {
+      const p = screenToImage(e.clientX, e.clientY);
+      const dx = p.x - drag.startX, dy = p.y - drag.startY;
+      const patch = drag.mode === 'move'
+        ? { x: drag.orig.x + dx, y: drag.orig.y + dy }
+        : { width: Math.max(10, drag.orig.width + dx), height: Math.max(10, drag.orig.height + dy) };
+      store.updateBooth(drag.id, patch);
+    };
+    const onUp = () => setDrag(null);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [drag, store, totalScale]);
+
+  // Draw new booth
+  useEffect(() => {
+    if (!drawing) return;
+    const onMove = (e) => {
+      const p = screenToImage(e.clientX, e.clientY);
+      setDrawing(d => d ? { ...d,
+        x: Math.min(d.startX, p.x), y: Math.min(d.startY, p.y),
+        width: Math.abs(p.x - d.startX), height: Math.abs(p.y - d.startY),
+      } : null);
+    };
+    const onUp = () => {
+      if (drawing && drawing.width > 10 && drawing.height > 10) {
+        const created = store.createBooth({
+          x: drawing.x, y: drawing.y, width: drawing.width, height: drawing.height,
+          label: `New ${booths.length + 1}`,
+        });
+        setSelectedBoothId(created.id);
+      }
+      setDrawing(null);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [drawing, booths.length]);
+
+  // Pan
+  useEffect(() => {
+    if (!panning) return;
+    const onMove = (e) => setPan({ x: panning.ox + (e.clientX - panning.sx), y: panning.oy + (e.clientY - panning.sy) });
+    const onUp = () => setPanning(null);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [panning]);
+
+  const onContainerDown = (e) => {
+    if (e.target.closest('rect.booth-rect') || e.target.closest('rect.resize-handle')) return;
+    if (mode === 'add') {
+      const p = screenToImage(e.clientX, e.clientY);
+      setDrawing({ startX: p.x, startY: p.y, x: p.x, y: p.y, width: 0, height: 0 });
+      return;
+    }
+    setPanning({ sx: e.clientX, sy: e.clientY, ox: pan.x, oy: pan.y });
+  };
+  const onWheel = (e) => {
+    e.preventDefault();
+    const delta = -Math.sign(e.deltaY) * 0.1;
+    setZoom(z => Math.min(4, Math.max(0.3, z + delta)));
+  };
+  const reset = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+
+  const boothLogo = (b) => {
+    if (!store.settings.showSponsorLogos || !b.sponsorId) return null;
+    return sponsorById[b.sponsorId]?.logoUrl || null;
+  };
+  const levelColor = (b) => levelById[b.levelId]?.color || '#3B82F6';
+
+  const assignedCount = booths.filter(b => b.sponsorId).length;
+
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="bg-white border-b border-gray-200 px-3 py-2 flex items-center gap-2 flex-wrap">
+        <div className="mr-auto text-xs text-gray-600">
+          <b>{booths.length}</b> booths, <b>{assignedCount}</b> assigned
+        </div>
+        <div className="flex items-center gap-1">
+          <button onClick={() => setZoom(z => Math.max(0.3, z - 0.25))} className="w-8 h-8 border border-gray-300 rounded bg-white hover:bg-gray-50">−</button>
+          <span className="text-xs text-gray-600 w-12 text-center">{Math.round(zoom * 100)}%</span>
+          <button onClick={() => setZoom(z => Math.min(4, z + 0.25))} className="w-8 h-8 border border-gray-300 rounded bg-white hover:bg-gray-50">+</button>
+          <button onClick={reset} className="ml-2 text-xs px-2 py-1 border border-gray-300 rounded bg-white hover:bg-gray-50">Fit</button>
+        </div>
+      </div>
+      <div ref={containerRef} className="flex-1 relative overflow-hidden bg-gray-100"
+           style={{ cursor: panning ? 'grabbing' : (mode === 'add' ? 'crosshair' : 'grab') }}
+           onMouseDown={onContainerDown} onWheel={onWheel}>
+        <div className="absolute"
+             style={{
+               left: '50%', top: '50%',
+               transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px)) scale(${totalScale})`,
+               transformOrigin: 'center center',
+               width: floorPlan.width, height: floorPlan.height,
+             }}>
+          <img src={floorPlan.dataUrl} alt="floor plan" draggable={false}
+               style={{ width: floorPlan.width, height: floorPlan.height, display: 'block' }} />
+          <svg width={floorPlan.width} height={floorPlan.height}
+               viewBox={`0 0 ${floorPlan.width} ${floorPlan.height}`}
+               style={{ position: 'absolute', left: 0, top: 0 }}>
+            {booths.map(b => {
+              const fill = levelColor(b);
+              const logo = boothLogo(b);
+              const isSelected = b.id === selectedBoothId;
+              return (
+                <g key={b.id}>
+                  <rect className="booth-rect"
+                        x={b.x} y={b.y} width={b.width} height={b.height}
+                        fill={fill} fillOpacity={b.sponsorId ? 0.85 : 0.45}
+                        stroke={isSelected ? '#111827' : fill}
+                        strokeWidth={isSelected ? 3 : 1.5}
+                        onMouseDown={(e) => {
+                          e.stopPropagation();
+                          setSelectedBoothId(b.id);
+                          if (mode === 'edit') {
+                            const p = screenToImage(e.clientX, e.clientY);
+                            setDrag({ id: b.id, mode: 'move', startX: p.x, startY: p.y, orig: { ...b } });
+                          }
+                        }}
+                        onClick={(e) => { e.stopPropagation(); if (mode !== 'edit' && mode !== 'add') onOpenPopup(b); }}
+                  />
+                  {logo && (
+                    <image href={logo}
+                           x={b.x + b.width * 0.1} y={b.y + b.height * 0.28}
+                           width={b.width * 0.8} height={b.height * 0.6}
+                           preserveAspectRatio="xMidYMid meet"
+                           style={{ pointerEvents: 'none' }} />
+                  )}
+                  <text className="booth-label"
+                        x={b.x + b.width / 2}
+                        y={logo ? b.y + b.height * 0.2 : b.y + b.height / 2 + 3}
+                        textAnchor="middle"
+                        style={{ fill: readableTextColor(fill) }}>
+                    {b.label}
+                  </text>
+                  {mode === 'edit' && isSelected && (
+                    <rect className="resize-handle"
+                          x={b.x + b.width - 6} y={b.y + b.height - 6}
+                          width="12" height="12"
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            const p = screenToImage(e.clientX, e.clientY);
+                            setDrag({ id: b.id, mode: 'resize', startX: p.x, startY: p.y, orig: { ...b } });
+                          }} />
+                  )}
+                  {b.partnerBoothId && store.boothById[b.partnerBoothId] && (
+                    <line x1={b.x + b.width/2} y1={b.y + b.height/2}
+                          x2={store.boothById[b.partnerBoothId].x + store.boothById[b.partnerBoothId].width/2}
+                          y2={store.boothById[b.partnerBoothId].y + store.boothById[b.partnerBoothId].height/2}
+                          stroke="#111827" strokeWidth="2" strokeDasharray="4,3" />
+                  )}
+                </g>
+              );
+            })}
+            {drawing && (
+              <rect x={drawing.x} y={drawing.y} width={drawing.width} height={drawing.height}
+                    fill="#3B82F6" fillOpacity="0.25" stroke="#3B82F6" strokeWidth="2" strokeDasharray="6,3" />
+            )}
+          </svg>
+        </div>
+        {booths.length === 0 && (
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-sm p-6 text-center max-w-sm">
+            <div className="text-2xl mb-2 text-gray-300">▦</div>
+            <h6 className="font-semibold">No booths yet</h6>
+            <p className="text-xs text-gray-500 mt-1">
+              Switch to <code className="text-pink-600">+ Add</code> in the sidebar and drag to draw a booth,
+              or click <b>Re-run auto-detect</b>.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AdminView() {
+  const store = useStore();
+  const [selectedBoothId, setSelectedBoothId] = useState(null);
+  const [mode, setMode] = useState('select');
+  const [popupBooth, setPopupBooth] = useState(null);
+  const [assignBooth, setAssignBooth] = useState(null);
+  const [showReDetect, setShowReDetect] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const reuploadRef = useRef(null);
+
+  const openPopup = (b) => { setSelectedBoothId(b.id); setPopupBooth(b); };
+  const openAssign = (b) => { setSelectedBoothId(b.id); setPopupBooth(null); setAssignBooth(b); };
+
+  const onReupload = () => reuploadRef.current?.click();
+  const onReDetect = () => {
+    if (store.booths.length > 0) {
+      if (!confirm(`Re-running auto-detect will replace all ${store.booths.length} existing booths and their sponsor assignments. Continue?`)) return;
+    }
+    setShowReDetect(true);
+  };
+  const onReuploadFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return; e.target.value = '';
+    let dataUrl;
+    if (file.type === 'application/pdf') {
+      const blob = await pdfFirstPageToBlob(file);
+      dataUrl = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
+    } else {
+      dataUrl = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(file); });
+    }
+    const img = await loadImage(dataUrl);
+    if (img.naturalWidth !== store.floorPlan.width || img.naturalHeight !== store.floorPlan.height) {
+      if (!confirm('The new image has different dimensions than the existing booth coordinates. Booth positions will not be moved automatically. Continue?')) return;
+    }
+    store.replaceFloorPlanImage(dataUrl, img.naturalWidth, img.naturalHeight);
+  };
+
+  return (
+    <div className="flex-1 flex overflow-hidden">
+      <AdminSidebar mode={mode} setMode={setMode}
+                    onOpenAssign={openAssign}
+                    onReupload={onReupload} onReDetect={onReDetect}
+                    onImportSponsors={() => setShowImport(true)}
+                    selectedBoothId={selectedBoothId} setSelectedBoothId={setSelectedBoothId} />
+      <AdminFloorPlanCanvas selectedBoothId={selectedBoothId} setSelectedBoothId={setSelectedBoothId}
+                            mode={mode} onOpenPopup={openPopup} />
+      {popupBooth && <BoothEditPopup booth={popupBooth} onClose={() => setPopupBooth(null)} onOpenAssign={openAssign} />}
+      {assignBooth && <AssignSponsorModal booth={assignBooth} onClose={() => setAssignBooth(null)} />}
+      {showReDetect && <ReDetectBoothsModal onClose={() => setShowReDetect(false)} />}
+      {showImport && <SponsorImportModal onClose={() => setShowImport(false)} />}
+      <input ref={reuploadRef} type="file" className="hidden" accept="image/*,application/pdf" onChange={onReuploadFile} />
+    </div>
+  );
+}
+
+// =====================================================================
+// SECTION 6: User (sponsor) view
+// =====================================================================
+/**
+ * Anchored, draggable action card used for the sponsor's Select→Confirm flow.
+ * Positions itself next to the selected booth (right side by default, flips
+ * to left / above / below if it would go off-screen) so the booth stays
+ * visible. Header is a drag handle so the user can move it aside if needed.
+ */
+function BoothActionCard({
+  booth, partner, step,
+  showOrientationToggle, orientation, onSetOrientation,
+  onCancel, onSelect, onConfirm,
+}) {
+  const store = useStore();
+  const [pos, setPos] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const cardRef = useRef(null);
+  const CARD_W = 360;
+
+  // Compute initial position based on the booth's on-screen bbox.
+  useEffect(() => {
+    const el = document.querySelector(`[data-booth-id="${booth.id}"] rect.booth-rect`);
+    const cardH = 260;
+    if (!el) {
+      setPos({ x: window.innerWidth - CARD_W - 24, y: 80 });
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    const partnerEl = partner
+      ? document.querySelector(`[data-booth-id="${partner.id}"] rect.booth-rect`)
+      : null;
+    // Combined bounding box (booth + partner) so we can avoid both.
+    let union = { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+    if (partnerEl) {
+      const p = partnerEl.getBoundingClientRect();
+      union = {
+        left:   Math.min(union.left, p.left),
+        right:  Math.max(union.right, p.right),
+        top:    Math.min(union.top, p.top),
+        bottom: Math.max(union.bottom, p.bottom),
+      };
+    }
+    const gap = 16;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let x, y;
+    if (union.right + gap + CARD_W <= vw - 12) {          // room right?
+      x = union.right + gap;
+      y = Math.max(12, Math.min(vh - cardH - 12, union.top));
+    } else if (union.left - gap - CARD_W >= 12) {          // room left?
+      x = union.left - gap - CARD_W;
+      y = Math.max(12, Math.min(vh - cardH - 12, union.top));
+    } else if (union.bottom + gap + cardH <= vh - 12) {    // room below?
+      x = Math.max(12, Math.min(vw - CARD_W - 12, union.left));
+      y = union.bottom + gap;
+    } else {                                                // fall back above
+      x = Math.max(12, Math.min(vw - CARD_W - 12, union.left));
+      y = Math.max(12, union.top - gap - cardH);
+    }
+    setPos({ x, y });
+  }, [booth.id, partner?.id]);
+
+  const onDragStart = (e) => {
+    if (e.target.closest('button, input')) return;
+    e.preventDefault();
+    setDragging(true);
+    const sx = e.clientX, sy = e.clientY, ox = pos.x, oy = pos.y;
+    const onMove = (ev) => setPos({ x: ox + (ev.clientX - sx), y: oy + (ev.clientY - sy) });
+    const onUp = () => {
+      setDragging(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  if (!pos) return null;
+  const sponsor = store.sponsorById[store.activeSponsorId];
+
+  return (
+    <div ref={cardRef}
+         className="fixed bg-white rounded-xl shadow-2xl border border-gray-200 z-50"
+         style={{ left: pos.x, top: pos.y, width: CARD_W }}>
+      {/* Drag handle header */}
+      <div onMouseDown={onDragStart}
+           style={{ cursor: dragging ? 'grabbing' : 'grab' }}
+           className="px-4 py-3 border-b border-gray-100 flex items-center gap-2 select-none">
+        <span className="text-gray-300 leading-none" title="Drag to move">⋮⋮</span>
+        <h5 className="font-semibold text-sm text-gray-900 flex-1">
+          {step === 'select' ? `Booth ${booth.label}` : 'Are you sure?'}
+        </h5>
+        <button onClick={onCancel}
+                className="text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+      </div>
+
+      {/* Body */}
+      <div className="px-4 py-3">
+        {step === 'select' && (
+          <>
+            <p className="text-sm mb-2">
+              Select this booth as <strong>{sponsor?.name}</strong>?
+            </p>
+            {partner && (
+              <div className="mt-2 p-2 rounded bg-pink-50 border border-pink-200 text-xs">
+                <div>
+                  ⊞ <strong>Double booth</strong> — this will also reserve the
+                  {' '}{orientation === 'horizontal' ? 'horizontally' : 'vertically'} adjacent
+                  {' '}booth <strong>{partner.label}</strong>.
+                </div>
+                {showOrientationToggle && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <span className="text-gray-600">Orientation:</span>
+                    <div className="inline-flex rounded overflow-hidden border border-pink-300">
+                      <button onClick={() => onSetOrientation('vertical')}
+                              className={`px-2 py-0.5 text-xs ${orientation === 'vertical' ? 'bg-pink-600 text-white' : 'bg-white text-pink-700 hover:bg-pink-50'}`}>
+                        Vertical
+                      </button>
+                      <button onClick={() => onSetOrientation('horizontal')}
+                              className={`px-2 py-0.5 text-xs ${orientation === 'horizontal' ? 'bg-pink-600 text-white' : 'bg-white text-pink-700 hover:bg-pink-50'}`}>
+                        Horizontal
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+        {step === 'confirm' && (
+          <>
+            <p className="text-sm">
+              Once you select a booth, it will be locked in for your company.
+              You will need to contact your meeting planner to request a change.
+            </p>
+            <div className="mt-2 text-sm text-gray-700">
+              Booth: <strong>{booth.label}</strong>
+              {partner && (
+                <>
+                  {' '}+ <strong>{partner.label}</strong>{' '}
+                  <span className="text-xs uppercase font-semibold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded ml-1">
+                    Double {orientation === 'horizontal' ? '(H)' : '(V)'}
+                  </span>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Actions */}
+      <div className="px-4 py-3 border-t border-gray-100">
+        {step === 'select' && (
+          <div className="flex gap-2">
+            <button onClick={onCancel}
+                    className="flex-1 px-3 py-2 text-sm bg-gray-100 hover:bg-gray-200 rounded">Cancel</button>
+            <button onClick={onSelect}
+                    className="flex-1 px-3 py-2 text-sm bg-blue-600 text-white hover:bg-blue-700 rounded">
+              Select this Booth
+            </button>
+          </div>
+        )}
+        {step === 'confirm' && (
+          <div className="flex flex-col gap-2">
+            <button onClick={onCancel}
+                    className="px-3 py-2 text-sm bg-gray-100 hover:bg-gray-200 rounded">
+              Cancel — I want to keep looking
+            </button>
+            <button onClick={onConfirm}
+                    className="px-3 py-2 text-sm bg-emerald-600 text-white hover:bg-emerald-700 rounded">
+              Confirmed — this is my booth
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BoothSelectModal({ booth, partner, showOrientationToggle, orientation, onSetOrientation, onCancel, onSelect }) {
+  const store = useStore();
+  return (
+    <Modal onClose={onCancel}>
+      <div className="px-5 py-4 border-b flex items-center gap-2">
+        <h3 className="text-lg font-semibold">Booth {booth.label}</h3>
+        <button onClick={onCancel} className="ml-auto text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+      </div>
+      <div className="px-5 py-4">
+        <p className="text-sm mb-2">You are about to select this booth as <strong>{store.sponsorById[store.activeSponsorId]?.name}</strong>.</p>
+        {partner && (
+          <div className="mt-2 p-3 rounded bg-blue-50 border border-blue-200 text-sm">
+            <div>
+              ⊞ Because you have a <strong>double booth</strong> reservation, this will also reserve the {orientation === 'horizontal' ? 'horizontally' : 'vertically'} adjacent booth <strong>{partner.label}</strong>.
+            </div>
+            {showOrientationToggle && (
+              <div className="mt-3 flex items-center gap-2">
+                <span className="text-xs text-gray-600">Orientation:</span>
+                <div className="inline-flex rounded overflow-hidden border border-blue-300">
+                  <button onClick={() => onSetOrientation('vertical')}
+                          className={`px-3 py-1 text-xs ${orientation === 'vertical' ? 'bg-blue-600 text-white' : 'bg-white text-blue-700 hover:bg-blue-50'}`}>
+                    Vertical
+                  </button>
+                  <button onClick={() => onSetOrientation('horizontal')}
+                          className={`px-3 py-1 text-xs ${orientation === 'horizontal' ? 'bg-blue-600 text-white' : 'bg-white text-blue-700 hover:bg-blue-50'}`}>
+                    Horizontal
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="px-5 py-3 border-t flex justify-end gap-2">
+        <button onClick={onCancel} className="px-4 py-2 text-sm bg-gray-100 hover:bg-gray-200 rounded">Cancel</button>
+        <button onClick={onSelect} className="px-4 py-2 text-sm bg-blue-600 text-white hover:bg-blue-700 rounded">Select this Booth</button>
+      </div>
+    </Modal>
+  );
+}
+function ConfirmBoothModal({ booth, partner, orientation, isDouble, onCancel, onConfirm }) {
+  return (
+    <Modal onClose={onCancel} dim="rgba(0,0,0,0.5)">
+      <div className="px-5 py-4 border-b flex items-center gap-2">
+        <h3 className="text-lg font-semibold">Are you sure?</h3>
+        <button onClick={onCancel} className="ml-auto text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+      </div>
+      <div className="px-5 py-4">
+        <p className="text-sm">Once you select a booth, it will be locked in for your company. You will need to contact your meeting planner to request a change.</p>
+        <div className="mt-2 text-sm text-gray-600">
+          Booth: <strong>{booth.label}</strong>
+          {partner && (
+            <>
+              {' '}+ <strong>{partner.label}</strong>{' '}
+              <span className="text-xs uppercase font-semibold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded ml-1">
+                Double {orientation === 'horizontal' ? '(H)' : '(V)'}
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+      <div className="px-5 py-3 border-t flex flex-col gap-2">
+        <button onClick={onCancel} className="px-4 py-2 text-sm bg-gray-100 hover:bg-gray-200 rounded">Cancel — I want to keep looking</button>
+        <button onClick={onConfirm} className="px-4 py-2 text-sm bg-emerald-600 text-white hover:bg-emerald-700 rounded">Confirmed — this is my booth</button>
+      </div>
+    </Modal>
+  );
+}
+function BoothMessageModal({ title, body, sponsor, onClose }) {
+  const store = useStore();
+  return (
+    <Modal onClose={onClose} size="sm" dim="rgba(0,0,0,0.3)">
+      <div className="px-5 py-3 border-b flex items-center">
+        <h6 className="font-semibold">{title}</h6>
+        <button onClick={onClose} className="ml-auto text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+      </div>
+      <div className="px-5 py-3 text-sm">
+        {sponsor && (
+          <div className="flex items-center gap-2 mb-2">
+            {store.settings.showSponsorLogos && sponsor.logoUrl && (
+              <img src={sponsor.logoUrl} alt="" className="w-8 h-8 rounded-full" />
+            )}
+            <strong>{sponsor.name}</strong>
+          </div>
+        )}
+        <div>{body}</div>
+      </div>
+      <div className="px-5 py-2 border-t flex justify-end">
+        <button onClick={onClose} className="px-3 py-1.5 text-sm bg-gray-100 hover:bg-gray-200 rounded">Close</button>
+      </div>
+    </Modal>
+  );
+}
+
+function UserView() {
+  const store = useStore();
+  const containerRef = useRef(null);
+  const [scale, setScale] = useState(1);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [panning, setPanning] = useState(null);
+  const [message, setMessage] = useState(null);
+  // Unified selection flow — `action` holds { booth, step: 'select'|'confirm' }
+  const [action, setAction] = useState(null);
+
+  const { floorPlan, booths, levelById, sponsorById } = store;
+  const activeSponsor = store.activeSponsorId ? sponsorById[store.activeSponsorId] : null;
+  const activeLevel = activeSponsor ? levelById[activeSponsor.levelId] : null;
+  const lockedBooth = activeSponsor ? booths.find(b => b.sponsorId === activeSponsor.id && b.locked) : null;
+  const lockedPartner = lockedBooth?.partnerBoothId ? store.boothById[lockedBooth.partnerBoothId] : null;
+
+  useEffect(() => {
+    if (!containerRef.current || !floorPlan) return;
+    const fit = () => {
+      const r = containerRef.current.getBoundingClientRect();
+      const s = Math.min(r.width / floorPlan.width, r.height / floorPlan.height, 1);
+      setScale(s > 0 ? s : 1);
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [floorPlan, store.activeSponsorId]);
+
+  useEffect(() => {
+    if (!panning) return;
+    const onMove = (e) => setPan({ x: panning.ox + (e.clientX - panning.sx), y: panning.oy + (e.clientY - panning.sy) });
+    const onUp = () => setPanning(null);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [panning]);
+
+  const totalScale = scale * zoom;
+  const onContainerDown = (e) => {
+    if (e.target.closest('g.booth-group')) return;
+    setPanning({ sx: e.clientX, sy: e.clientY, ox: pan.x, oy: pan.y });
+  };
+  const onWheel = (e) => {
+    e.preventDefault();
+    const delta = -Math.sign(e.deltaY) * 0.1;
+    setZoom(z => Math.min(4, Math.max(0.3, z + delta)));
+  };
+  const reset = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+
+  const orderBlock = (() => {
+    if (!store.settings.enforceSelectionOrder || !activeSponsor || lockedBooth) return '';
+    if (store.canSponsorPickNow(store.activeSponsorId)) return '';
+    const ordered = store.sponsorsAtLevel(activeSponsor.levelId);
+    for (const ahead of ordered) {
+      if (ahead.id === activeSponsor.id) break;
+      const has = booths.some(b => b.sponsorId === ahead.id);
+      if (!has) return `Selection order is enforced: ${ahead.name} must be assigned a booth first.`;
+    }
+    return '';
+  })();
+
+  const boothFill = (b) => {
+    if (!activeSponsor) return levelById[b.levelId]?.color || '#3B82F6';
+    if (b.sponsorId === activeSponsor.id) return levelById[b.levelId]?.color || '#3B82F6';
+    if (b.sponsorId) return '#9CA3AF';
+    if (b.levelId !== activeSponsor.levelId) return '#D1D5DB';
+    return levelById[b.levelId]?.color || '#3B82F6';
+  };
+  const boothOpacity = (b) => {
+    if (!activeSponsor) return 0.5;
+    if (b.sponsorId === activeSponsor.id) return 0.95;
+    if (b.sponsorId) return 0.7;
+    return 0.5;
+  };
+  const boothLogo = (b) => {
+    if (!store.settings.showSponsorLogos || !b.sponsorId) return null;
+    return sponsorById[b.sponsorId]?.logoUrl || null;
+  };
+
+  const handleBoothClick = (b) => {
+    if (!activeSponsor) return;
+    if (b.sponsorId === activeSponsor.id) {
+      setMessage({ title: `Booth ${b.label}`, body: b.locked ? 'This is your booth (locked in). Contact your meeting planner to change.' : 'This is your currently held booth.' });
+      return;
+    }
+    if (b.sponsorId) {
+      const sponsor = sponsorById[b.sponsorId];
+      const showName = store.settings.showAssignmentsToSponsors;
+      setMessage({
+        title: `Booth ${b.label}`,
+        body: showName ? `Assigned to ${sponsor?.name || 'another sponsor'}.` : 'Booth Occupied',
+        sponsor: showName ? sponsor : null,
+      });
+      return;
+    }
+    if (b.levelId !== activeSponsor.levelId) {
+      setMessage({ title: `Booth ${b.label}`, body: `This booth is in another category (${levelById[b.levelId]?.name}).` });
+      return;
+    }
+    if (lockedBooth) {
+      setMessage({ title: `Booth ${lockedBooth.label}`, body: 'You have already locked in your booth. Contact your meeting planner to change.' });
+      return;
+    }
+    if (!store.canSponsorPickNow(store.activeSponsorId)) {
+      setMessage({ title: 'Not your turn yet', body: orderBlock || 'Selection order is enforced; sponsors ahead of you must be assigned first.' });
+      return;
+    }
+    if (activeSponsor.isDoubleBooth) {
+      const parts = findAdjacentPartners(b, booths);
+      const orient = store.settings.doubleBoothOrientation;
+      const availableVert  = !!parts.vertical;
+      const availableHoriz = !!parts.horizontal;
+      let allowed = false;
+      if (orient === 'vertical')   allowed = availableVert;
+      else if (orient === 'horizontal') allowed = availableHoriz;
+      else allowed = availableVert || availableHoriz;
+      if (!allowed) {
+        const which = orient === 'vertical' ? 'vertical ' : orient === 'horizontal' ? 'horizontal ' : '';
+        setMessage({ title: `Booth ${b.label}`, body: `Your booking requires a double booth, but this booth has no ${which}adjacent empty same-category booth. Pick a different booth.` });
+        return;
+      }
+    }
+    setAction({ booth: b, step: 'select' });
+  };
+
+  // Given a booth and the current orientation choice, return the partner (or null).
+  const partnerFor = (b, prefOrient) => {
+    if (!activeSponsor?.isDoubleBooth) return null;
+    return pickPartnerBySetting(b, booths, store.settings.doubleBoothOrientation, prefOrient);
+  };
+
+  // Track user's orientation choice (only meaningful when setting = 'user-toggle')
+  const [chosenOrient, setChosenOrient] = useState('vertical');
+
+  const doConfirm = () => {
+    if (!action) return;
+    const chosen = store.settings.doubleBoothOrientation === 'user-toggle'
+      ? chosenOrient : store.settings.doubleBoothOrientation;
+    const partner = partnerFor(action.booth, chosen);
+    const res = store.lockBoothForSponsor(action.booth.id, store.activeSponsorId, {
+      partnerBoothId: partner?.id ?? null,
+      orientation: chosen,
+    });
+    setAction(null);
+    if (!res.ok) {
+      setMessage({ title: 'Selection rejected', body: res.message });
+    }
+  };
+
+  return (
+    <div className="flex-1 flex overflow-hidden">
+      {/* Sponsor picker (test mode) */}
+      <div className="w-72 bg-white border-r border-gray-200 flex flex-col flex-shrink-0">
+        <div className="px-4 py-3 border-b border-gray-200">
+          <div className="text-xs uppercase tracking-wide text-gray-500">Test mode</div>
+          <div className="text-sm font-medium text-gray-900 mt-0.5">Pick a sponsor</div>
+          <div className="text-xs text-gray-500 mt-1">In production this comes from CMS auth.</div>
+        </div>
+        <div className="flex-1 overflow-y-auto scroll-thin">
+          {store.levels.map(level => {
+            const lvSponsors = store.sponsorsAtLevel(level.id);
+            return (
+              <div key={level.id}>
+                <div className="px-4 py-2 bg-gray-50 text-xs font-semibold text-gray-700 flex items-center gap-2">
+                  <span className="inline-block w-3 h-3 rounded-sm" style={{ background: level.color }} />
+                  {level.name}
+                </div>
+                {lvSponsors.map(sp => {
+                  const myBooth = booths.find(b => b.sponsorId === sp.id);
+                  return (
+                    <button key={sp.id} onClick={() => store.setActiveSponsorId(sp.id)}
+                            className={`w-full text-left px-4 py-2 border-b border-gray-100 hover:bg-blue-50 flex items-center gap-2 ${store.activeSponsorId === sp.id ? 'bg-blue-50' : ''}`}>
+                      {store.settings.showSponsorLogos && sp.logoUrl && (
+                        <img src={sp.logoUrl} alt="" className="w-6 h-6 rounded-full" />
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm text-gray-900 truncate flex items-center gap-1">
+                          {sp.name}
+                          {sp.isDoubleBooth && <span className="text-[9px] uppercase font-semibold text-amber-700 bg-amber-100 px-1 py-0.5 rounded">2×</span>}
+                        </div>
+                        <div className="text-xs text-gray-500">
+                          {myBooth ? (myBooth.locked ? `🔒 ${myBooth.label}` : `Held: ${myBooth.label}`) : 'No booth'}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Main pane */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+        {!activeSponsor ? (
+          <div className="flex-1 flex items-center justify-center text-gray-500">← Pick a sponsor to view the floor plan.</div>
+        ) : (
+          <>
+            <div className="bg-white border-b border-gray-200 px-3 py-2 flex items-center gap-2 flex-wrap">
+              <div className="mr-auto text-sm flex items-center gap-2">
+                {store.settings.showSponsorLogos && activeSponsor.logoUrl && (
+                  <img src={activeSponsor.logoUrl} alt="" className="w-6 h-6 rounded-full" />
+                )}
+                Viewing as <strong>{activeSponsor.name}</strong>
+                <span className="text-xs px-2 py-0.5 rounded"
+                      style={{ background: activeLevel?.color, color: readableTextColor(activeLevel?.color) }}>
+                  {activeLevel?.name}
+                </span>
+                {activeSponsor.isDoubleBooth && (
+                  <span className="text-xs uppercase font-semibold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">Double booth</span>
+                )}
+                {lockedBooth && (
+                  <span className="text-xs uppercase font-semibold text-emerald-800 bg-emerald-100 px-1.5 py-0.5 rounded">
+                    🔒 Locked: {lockedBooth.label}{lockedPartner && ` + ${lockedPartner.label}`}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1">
+                <button onClick={() => setZoom(z => Math.max(0.3, z - 0.25))} className="w-8 h-8 border border-gray-300 rounded bg-white hover:bg-gray-50">−</button>
+                <span className="text-xs text-gray-600 w-12 text-center">{Math.round(zoom * 100)}%</span>
+                <button onClick={() => setZoom(z => Math.min(4, z + 0.25))} className="w-8 h-8 border border-gray-300 rounded bg-white hover:bg-gray-50">+</button>
+                <button onClick={reset} className="ml-2 text-xs px-2 py-1 border border-gray-300 rounded bg-white hover:bg-gray-50">Fit</button>
+              </div>
+            </div>
+            {orderBlock && (
+              <div className="mx-3 mt-3 p-2 rounded bg-cyan-50 border border-cyan-200 text-xs text-cyan-800">
+                ℹ️ {orderBlock}
+              </div>
+            )}
+            <div ref={containerRef} className="flex-1 relative overflow-hidden bg-gray-100"
+                 style={{ cursor: panning ? 'grabbing' : 'grab' }}
+                 onMouseDown={onContainerDown} onWheel={onWheel}>
+              <div className="absolute"
+                   style={{
+                     left: '50%', top: '50%',
+                     transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px)) scale(${totalScale})`,
+                     transformOrigin: 'center center',
+                     width: floorPlan.width, height: floorPlan.height,
+                   }}>
+                <img src={floorPlan.dataUrl} alt="floor plan" draggable={false}
+                     style={{ display: 'block', width: floorPlan.width, height: floorPlan.height }} />
+                <svg width={floorPlan.width} height={floorPlan.height}
+                     viewBox={`0 0 ${floorPlan.width} ${floorPlan.height}`}
+                     style={{ position: 'absolute', left: 0, top: 0 }}>
+                  {booths.map(b => {
+                    const fill = boothFill(b);
+                    const logo = boothLogo(b);
+                    const isOwnLocked = b.id === lockedBooth?.id || b.id === lockedPartner?.id;
+                    const isPendingPrimary = !!(action && action.booth.id === b.id);
+                    // Compute pending partner using the effective orientation of the current flow
+                    const pendingOrient = store.settings.doubleBoothOrientation === 'user-toggle'
+                      ? chosenOrient : store.settings.doubleBoothOrientation;
+                    const pendingPartner = action && activeSponsor?.isDoubleBooth
+                      ? partnerFor(action.booth, pendingOrient) : null;
+                    const isPendingPartner = !!(pendingPartner && pendingPartner.id === b.id);
+                    const pendingClass = isPendingPrimary
+                      ? 'booth-pending-primary'
+                      : isPendingPartner ? 'booth-pending-partner' : '';
+                    return (
+                      <g key={b.id} className="booth-group" data-booth-id={b.id}
+                         onClick={(e) => { e.stopPropagation(); handleBoothClick(b); }}>
+                        <rect className={`booth-rect ${pendingClass}`}
+                              x={b.x} y={b.y} width={b.width} height={b.height}
+                              fill={fill} fillOpacity={boothOpacity(b)}
+                              stroke={(isPendingPrimary || isPendingPartner) ? undefined
+                                : (b.sponsorId === activeSponsor.id ? '#111827' : fill)}
+                              strokeWidth={(isPendingPrimary || isPendingPartner) ? undefined
+                                : (isOwnLocked ? 3 : 1.5)} />
+                        {logo && (
+                          <image href={logo}
+                                 x={b.x + b.width * 0.1} y={b.y + b.height * 0.28}
+                                 width={b.width * 0.8} height={b.height * 0.6}
+                                 preserveAspectRatio="xMidYMid meet"
+                                 style={{ pointerEvents: 'none' }} />
+                        )}
+                        <text className="booth-label"
+                              x={b.x + b.width/2}
+                              y={logo ? b.y + b.height * 0.2 : b.y + b.height/2 + 3}
+                              textAnchor="middle"
+                              style={{ fill: readableTextColor(fill) }}>
+                          {b.label}
+                        </text>
+                      </g>
+                    );
+                  })}
+                </svg>
+              </div>
+              <div className="absolute bottom-3 left-3 bg-white rounded-lg shadow px-3 py-2 text-xs space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-3 h-3 rounded-sm" style={{ background: activeLevel?.color }} />
+                  Available ({activeLevel?.name})
+                </div>
+                <div className="flex items-center gap-2"><span className="inline-block w-3 h-3 rounded-sm bg-gray-400" /> Occupied</div>
+                <div className="flex items-center gap-2"><span className="inline-block w-3 h-3 rounded-sm bg-gray-300" /> Other category</div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {message && <BoothMessageModal {...message} onClose={() => setMessage(null)} />}
+      {action && (() => {
+        const parts = findAdjacentPartners(action.booth, booths);
+        const orient = store.settings.doubleBoothOrientation;
+        const isDouble = !!activeSponsor?.isDoubleBooth;
+        const canToggle = isDouble && orient === 'user-toggle' && parts.vertical && parts.horizontal;
+        // If setting is user-toggle but only one orientation is possible, snap to it.
+        const effectiveChoice = !isDouble ? null
+          : orient === 'vertical'   ? 'vertical'
+          : orient === 'horizontal' ? 'horizontal'
+          : (parts.vertical && parts.horizontal) ? chosenOrient
+          : (parts.vertical ? 'vertical' : 'horizontal');
+        const activePartner = !isDouble ? null
+          : effectiveChoice === 'vertical' ? parts.vertical : parts.horizontal;
+        return (
+          <BoothActionCard
+            booth={action.booth}
+            partner={activePartner}
+            step={action.step}
+            showOrientationToggle={canToggle}
+            orientation={effectiveChoice}
+            onSetOrientation={setChosenOrient}
+            onCancel={() => setAction(null)}
+            onSelect={() => setAction({ ...action, step: 'confirm' })}
+            onConfirm={doConfirm}
+          />
+        );
+      })()}
+    </div>
+  );
+}
+
+// =====================================================================
+// SECTION 6.5: Public view (read-only, attendee-facing)
+// =====================================================================
+function PublicView() {
+  const store = useStore();
+  const containerRef = useRef(null);
+  const [scale, setScale] = useState(1);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [panning, setPanning] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [cardPos, setCardPos] = useState(null);
+  const [cardDragging, setCardDragging] = useState(false);
+
+  const { floorPlan, booths, levelById, sponsorById } = store;
+  const totalScale = scale * zoom;
+
+  useEffect(() => {
+    if (!containerRef.current || !floorPlan) return;
+    const fit = () => {
+      const r = containerRef.current.getBoundingClientRect();
+      const s = Math.min(r.width / floorPlan.width, r.height / floorPlan.height, 1);
+      setScale(s > 0 ? s : 1);
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [floorPlan]);
+
+  useEffect(() => {
+    if (!panning) return;
+    const onMove = (e) => setPan({ x: panning.ox + (e.clientX - panning.sx), y: panning.oy + (e.clientY - panning.sy) });
+    const onUp = () => setPanning(null);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+  }, [panning]);
+
+  const onWheel = (e) => {
+    e.preventDefault();
+    const delta = -Math.sign(e.deltaY) * 0.1;
+    setZoom(z => Math.min(4, Math.max(0.3, z + delta)));
+  };
+  const onContainerDown = (e) => {
+    if (e.target.closest('[data-booth-id]')) return;
+    setPanning({ sx: e.clientX, sy: e.clientY, ox: pan.x, oy: pan.y });
+  };
+  const reset = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+
+  // Anchor sponsor card next to the clicked booth (same pattern as BoothActionCard).
+  useEffect(() => {
+    if (!selected) { setCardPos(null); return; }
+    const el = document.querySelector(`[data-booth-id="${selected.booth.id}"] rect.booth-rect`);
+    if (!el) { setCardPos({ x: window.innerWidth - 360 - 24, y: 100 }); return; }
+    const rect = el.getBoundingClientRect();
+    const CARD_W = 340, cardH = 220;
+    const gap = 16, vw = window.innerWidth, vh = window.innerHeight;
+    let x, y;
+    if (rect.right + gap + CARD_W <= vw - 12) {
+      x = rect.right + gap; y = Math.max(12, Math.min(vh - cardH - 12, rect.top));
+    } else if (rect.left - gap - CARD_W >= 12) {
+      x = rect.left - gap - CARD_W; y = Math.max(12, Math.min(vh - cardH - 12, rect.top));
+    } else if (rect.bottom + gap + cardH <= vh - 12) {
+      x = Math.max(12, Math.min(vw - CARD_W - 12, rect.left)); y = rect.bottom + gap;
+    } else {
+      x = Math.max(12, Math.min(vw - CARD_W - 12, rect.left)); y = Math.max(12, rect.top - gap - cardH);
+    }
+    setCardPos({ x, y });
+  }, [selected?.booth.id]);
+
+  const onCardDragStart = (e) => {
+    if (e.target.closest('button, a')) return;
+    e.preventDefault();
+    setCardDragging(true);
+    const sx = e.clientX, sy = e.clientY, ox = cardPos.x, oy = cardPos.y;
+    const onMove = (ev) => setCardPos({ x: ox + (ev.clientX - sx), y: oy + (ev.clientY - sy) });
+    const onUp = () => {
+      setCardDragging(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  if (!floorPlan) return null;
+
+  const onBoothClick = (b) => {
+    const sponsor = b.sponsorId ? sponsorById[b.sponsorId] : null;
+    setSelected({ booth: b, sponsor });
+  };
+
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="bg-white border-b border-gray-200 px-3 py-2 flex items-center gap-2 flex-wrap">
+        <div className="mr-auto text-sm">
+          <span className="text-xs uppercase tracking-wide text-gray-500">Attendee view</span>
+          <span className="ml-2 text-gray-700">Tap a booth to view sponsor details.</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <button onClick={() => setZoom(z => Math.max(0.3, z - 0.25))} className="w-8 h-8 border border-gray-300 rounded bg-white hover:bg-gray-50">−</button>
+          <span className="text-xs text-gray-600 w-12 text-center">{Math.round(zoom * 100)}%</span>
+          <button onClick={() => setZoom(z => Math.min(4, z + 0.25))} className="w-8 h-8 border border-gray-300 rounded bg-white hover:bg-gray-50">+</button>
+          <button onClick={reset} className="ml-2 text-xs px-2 py-1 border border-gray-300 rounded bg-white hover:bg-gray-50">Fit</button>
+        </div>
+      </div>
+      <div ref={containerRef} className="flex-1 relative overflow-hidden bg-gray-100"
+           style={{ cursor: panning ? 'grabbing' : 'grab' }}
+           onMouseDown={onContainerDown} onWheel={onWheel}>
+        <div className="absolute"
+             style={{
+               left: '50%', top: '50%',
+               transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px)) scale(${totalScale})`,
+               transformOrigin: 'center center',
+               width: floorPlan.width, height: floorPlan.height,
+             }}>
+          <img src={floorPlan.dataUrl} alt="floor plan" draggable={false}
+               style={{ display: 'block', width: floorPlan.width, height: floorPlan.height }} />
+          <svg width={floorPlan.width} height={floorPlan.height}
+               viewBox={`0 0 ${floorPlan.width} ${floorPlan.height}`}
+               style={{ position: 'absolute', left: 0, top: 0 }}>
+            {booths.map(b => {
+              const lvl = levelById[b.levelId];
+              const fill = lvl?.color || '#3B82F6';
+              const sponsor = b.sponsorId ? sponsorById[b.sponsorId] : null;
+              const logo = sponsor && store.settings.showSponsorLogos ? sponsor.logoUrl : null;
+              const isSelected = selected?.booth.id === b.id;
+              return (
+                <g key={b.id} data-booth-id={b.id}
+                   style={{ cursor: 'pointer' }}
+                   onClick={(e) => { e.stopPropagation(); onBoothClick(b); }}>
+                  <rect className="booth-rect"
+                        x={b.x} y={b.y} width={b.width} height={b.height}
+                        fill={fill} fillOpacity={sponsor ? 0.85 : 0.35}
+                        stroke={isSelected ? '#111827' : fill}
+                        strokeWidth={isSelected ? 3 : 1.5} />
+                  {logo && (
+                    <image href={logo}
+                           x={b.x + b.width * 0.1} y={b.y + b.height * 0.28}
+                           width={b.width * 0.8} height={b.height * 0.6}
+                           preserveAspectRatio="xMidYMid meet"
+                           style={{ pointerEvents: 'none' }} />
+                  )}
+                  <text className="booth-label"
+                        x={b.x + b.width/2}
+                        y={logo ? b.y + b.height * 0.2 : b.y + b.height/2 + 3}
+                        textAnchor="middle"
+                        style={{ fill: readableTextColor(fill) }}>
+                    {b.label}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+
+        {/* Category legend */}
+        <div className="absolute bottom-0 left-0 m-3 bg-white rounded-lg shadow px-3 py-2 text-xs space-y-1">
+          {store.levels.map(lvl => (
+            <div key={lvl.id} className="flex items-center gap-2">
+              <span className="inline-block w-3 h-3 rounded-sm" style={{ background: lvl.color }} />
+              {lvl.name}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Sponsor detail card */}
+      {selected && cardPos && (
+        <div className="fixed bg-white rounded-xl shadow-2xl border border-gray-200 z-50"
+             style={{ left: cardPos.x, top: cardPos.y, width: 340 }}>
+          <div onMouseDown={onCardDragStart}
+               style={{ cursor: cardDragging ? 'grabbing' : 'grab' }}
+               className="px-4 py-3 border-b border-gray-100 flex items-center gap-2 select-none">
+            <span className="text-gray-300 leading-none" title="Drag">⋮⋮</span>
+            <h5 className="font-semibold text-sm text-gray-900 flex-1">
+              Booth {selected.booth.label}
+            </h5>
+            <button onClick={() => setSelected(null)}
+                    className="text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+          </div>
+          <div className="px-4 py-3">
+            {selected.sponsor ? (
+              <>
+                <div className="flex items-center gap-3">
+                  {store.settings.showSponsorLogos && selected.sponsor.logoUrl && (
+                    <img src={selected.sponsor.logoUrl} alt=""
+                         className="w-16 h-16 rounded-full border border-gray-200 flex-shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="font-semibold text-gray-900 truncate">{selected.sponsor.name}</div>
+                    <div className="text-xs text-gray-500 mt-0.5 flex items-center gap-1">
+                      <span className="inline-block w-2 h-2 rounded-sm"
+                            style={{ background: levelById[selected.sponsor.levelId]?.color }} />
+                      {levelById[selected.sponsor.levelId]?.name}
+                    </div>
+                  </div>
+                </div>
+                {selected.sponsor.website && (
+                  <a href={selected.sponsor.website} target="_blank" rel="noopener noreferrer"
+                     className="mt-3 inline-flex items-center gap-2 text-sm text-blue-600 hover:underline break-all">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                      <polyline points="15 3 21 3 21 9" />
+                      <line x1="10" y1="14" x2="21" y2="3" />
+                    </svg>
+                    Visit sponsor page
+                  </a>
+                )}
+              </>
+            ) : (
+              <div className="text-sm text-gray-500 italic">This booth doesn't have a sponsor assigned yet.</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =====================================================================
+// SECTION 7: App root
+// =====================================================================
+function AppInner() {
+  const store = useStore();
+  return (
+    <div className="h-full flex flex-col">
+      <TopBar />
+      {!store.floorPlan
+        ? <UploadStep />
+        : store.role === 'admin' ? <AdminView />
+        : store.role === 'user'  ? <UserView />
+        :                          <PublicView />}
+    </div>
+  );
+}
+
+function App() {
+  const store = useStoreProvider();
+  return (
+    <StoreContext.Provider value={store}>
+      <AppInner />
+    </StoreContext.Provider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+<script>
+  (function () {
+    const src = document.getElementById('app-source').textContent;
+    try {
+      const out = Babel.transform(src, {
+        presets: [['react', { runtime: 'classic' }]],
+        sourceType: 'script',
+      }).code;
+      const s = document.createElement('script');
+      s.textContent = out;
+      document.body.appendChild(s);
+    } catch (e) {
+      const root = document.getElementById('root');
+      root.innerHTML =
+        '<div style="padding:24px;font-family:monospace;color:#b91c1c">'
+        + '<h3>Babel transform failed</h3><pre>' + (e && e.message ? e.message : e) + '</pre></div>';
+      console.error(e);
+    }
+  })();
+</script>
+</body>
+</html>
