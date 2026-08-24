@@ -1249,10 +1249,12 @@ function parseSponsorsFromHtml(htmlString, baseUrl) {
 // CMS to proxy the request server-side.
 async function fetchWithCorsFallback(url, headers = {}) {
   // 1) Our own backend at /api/scrape (present when deployed on Render/Node).
-  //    Same origin so no CORS involved. Silently skipped if 404 (static-only
+  //    Same origin so no CORS involved. `credentials: 'same-origin'` so Basic
+  //    Auth (or later, session cookies) flow through — 'omit' would drop them
+  //    and the request would 401. Silently skipped if 404 (static-only
   //    hosting like GitHub Pages).
   try {
-    const r = await fetch('/api/scrape?url=' + encodeURIComponent(url), { credentials: 'omit' });
+    const r = await fetch('/api/scrape?url=' + encodeURIComponent(url), { credentials: 'same-origin' });
     if (r.ok) return await r.text();
   } catch (_) { /* backend not reachable — try direct */ }
   // 2) Direct fetch (works if the target sends permissive CORS headers)
