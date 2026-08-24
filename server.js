@@ -1,7 +1,7 @@
 // Booth Selector — minimal Node/Express server for Render.
 //
 // Responsibilities right now:
-//   1. Serve index.html (the single-file React app).
+//   1. Serve the built SPA from dist/ (Vite build - see vite.config.js).
 //   2. Expose /api/scrape?url=… so the app can fetch sponsor pages
 //      without CORS issues (public proxies were unreliable).
 //   3. Optional Basic Auth gate via BASIC_AUTH_USER / BASIC_AUTH_PASS
@@ -103,9 +103,10 @@ app.get('/api/scrape', async (req, res) => {
 // Health check
 app.get('/healthz', (_, res) => res.type('text/plain').send('ok'));
 
-// Serve the SPA
-app.use(express.static(path.join(__dirname), { extensions: ['html'] }));
-app.get('*', (_, res) => res.sendFile(path.join(__dirname, 'index.html')));
+// Serve the built SPA (npm run build -> dist/, via vite.config.js)
+const DIST_DIR = path.join(__dirname, 'dist');
+app.use(express.static(DIST_DIR, { extensions: ['html'] }));
+app.get('*', (_, res) => res.sendFile(path.join(DIST_DIR, 'index.html')));
 
 app.listen(PORT, () => {
   console.log(`[booth-selector] listening on :${PORT}`);
