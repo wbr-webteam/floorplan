@@ -1,0 +1,16 @@
+{
+  "name": "floorplan-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend for the Booth Selector app — serves index.html + /api/scrape proxy",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

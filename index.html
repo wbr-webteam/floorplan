@@ -1248,12 +1248,19 @@ function parseSponsorsFromHtml(htmlString, baseUrl) {
 // third-party services — fine for demos, but for production you'd want your
 // CMS to proxy the request server-side.
 async function fetchWithCorsFallback(url, headers = {}) {
-  // 1) Direct
+  // 1) Our own backend at /api/scrape (present when deployed on Render/Node).
+  //    Same origin so no CORS involved. Silently skipped if 404 (static-only
+  //    hosting like GitHub Pages).
+  try {
+    const r = await fetch('/api/scrape?url=' + encodeURIComponent(url), { credentials: 'omit' });
+    if (r.ok) return await r.text();
+  } catch (_) { /* backend not reachable — try direct */ }
+  // 2) Direct fetch (works if the target sends permissive CORS headers)
   try {
     const r = await fetch(url, { headers, credentials: 'omit' });
     if (r.ok) return await r.text();
   } catch (_) { /* CORS or network */ }
-  // 2) Public CORS proxies
+  // 3) Public CORS proxies as a last resort
   const proxies = [
     (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
     (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
