@@ -24,6 +24,10 @@ const BASIC_PASS = process.env.BASIC_AUTH_PASS;
 
 if (BASIC_USER && BASIC_PASS) {
   app.use((req, res, next) => {
+    // Public API — /api/* is not gated. /healthz is always public too.
+    // This keeps server-side proxies (scrape) and future auth endpoints
+    // reachable to the app UI and to mobile clients.
+    if (req.path.startsWith('/api/') || req.path === '/healthz') return next();
     const header = req.headers.authorization || '';
     const [scheme, encoded] = header.split(' ');
     if (scheme === 'Basic' && encoded) {
@@ -33,7 +37,7 @@ if (BASIC_USER && BASIC_PASS) {
     res.set('WWW-Authenticate', 'Basic realm="Booth Selector"');
     return res.status(401).send('Authentication required.');
   });
-  console.log('[booth-selector] Basic Auth enabled for user:', BASIC_USER);
+  console.log('[booth-selector] Basic Auth enabled for user:', BASIC_USER, '(API + /healthz remain public)');
 }
 
 // ---------------------------------------------------------------------

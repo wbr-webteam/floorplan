@@ -1280,11 +1280,13 @@ async function fetchWithCorsFallback(url, headers = {}) {
 
 function SponsorImportModal({ onClose }) {
   const store = useStore();
-  const [tab, setTab] = useState('url'); // 'url' | 'paste' | 'siteUrl' | 'siteHtml'
+  // Default tab is "Website URL" — the most reliable path since the server-side
+  // proxy handles CORS. API/paste tabs remain for CMS integrations later.
+  const [tab, setTab] = useState('siteUrl'); // 'siteUrl' | 'siteHtml' | 'url' | 'paste'
   const [url, setUrl] = useState('https://api.iqpc.com/api/v2/event/6879132f670da3225a72b4e2/sponsors?modified_date=2026-05-17T18:19:35');
   const [headers, setHeaders] = useState('');
   const [pasteText, setPasteText] = useState('');
-  const [siteUrl, setSiteUrl] = useState('https://etaileast.wbresearch.com/sponsors');
+  const [siteUrl, setSiteUrl] = useState('https://etailbrand.wbresearch.com/sponsors');
   const [siteHtml, setSiteHtml] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -1380,14 +1382,6 @@ function SponsorImportModal({ onClose }) {
 
       <div className="px-5 py-3 border-b border-gray-100">
         <div className="inline-flex rounded overflow-hidden border border-gray-300 text-xs flex-wrap">
-          <button onClick={() => setTab('url')}
-                  className={`px-3 py-1 ${tab === 'url' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
-            API URL
-          </button>
-          <button onClick={() => setTab('paste')}
-                  className={`px-3 py-1 ${tab === 'paste' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
-            Paste JSON
-          </button>
           <button onClick={() => setTab('siteUrl')}
                   className={`px-3 py-1 ${tab === 'siteUrl' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
             Website URL
@@ -1395,6 +1389,14 @@ function SponsorImportModal({ onClose }) {
           <button onClick={() => setTab('siteHtml')}
                   className={`px-3 py-1 ${tab === 'siteHtml' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
             Paste HTML
+          </button>
+          <button onClick={() => setTab('url')}
+                  className={`px-3 py-1 ${tab === 'url' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
+            API URL
+          </button>
+          <button onClick={() => setTab('paste')}
+                  className={`px-3 py-1 ${tab === 'paste' ? 'bg-blue-600 text-white' : 'bg-white text-gray-700'}`}>
+            Paste JSON
           </button>
         </div>
       </div>
@@ -1985,7 +1987,7 @@ function AdminSidebar({ mode, setMode, onOpenAssign, onReupload, onReDetect, onI
           ⌘ Re-run auto-detect
         </button>
         <button onClick={onImportSponsors} className="w-full text-xs py-1.5 border border-gray-300 rounded bg-white hover:bg-gray-50">
-          ⇩ Import sponsors from API / JSON
+          ⇩ Import Sponsors
         </button>
         <label className="flex items-center gap-2 text-xs text-gray-700 cursor-pointer">
           <input type="checkbox" checked={store.settings.showAssignmentsToSponsors}
